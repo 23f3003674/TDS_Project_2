@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  quiz-solver:
+    build: .
+    container_name: llm-quiz-solver
+    ports:
+      - "7860:7860"
+    environment:
+      - STUDENT_EMAIL=${STUDENT_EMAIL}
+      - STUDENT_SECRET=${STUDENT_SECRET}
+      - AIMLAPI_BASE_URL=${AIMLAPI_BASE_URL:-https://aipipe.org/openai/v1}
+      - AIMLAPI_MODEL=${AIMLAPI_MODEL:-gpt-5-nano}
+      - AIMLAPI_API_KEY=${AIMLAPI_API_KEY}
+      - PORT=7860
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
