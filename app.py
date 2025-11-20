@@ -312,8 +312,8 @@ IMPORTANT:
                 {"role": "system", "content": "You are a data analyst. Respond with valid JSON only."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1,
-            max_completion_tokens=2000
+            #temperature=0.1,
+            #max_completion_tokens=2000
         )
         
         response_text = response.choices[0].message.content
