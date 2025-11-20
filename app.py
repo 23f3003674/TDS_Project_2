@@ -41,6 +41,10 @@ AIMLAPI_BASE_URL = os.getenv("AIMLAPI_BASE_URL", "https://aipipe.org/openai/v1")
 AIMLAPI_API_KEY = os.getenv("AIMLAPI_API_KEY")
 AIMLAPI_MODEL = os.getenv("AIMLAPI_MODEL", "gpt-5-nano")
 
+# Allow overriding chromium/chromedriver path via env for portability
+CHROME_BINARY = os.getenv("CHROME_BINARY", "/usr/bin/chromium")
+CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+
 # Log configuration status
 logger.info("="*60)
 logger.info("🔧 Configuration Status:")
@@ -49,6 +53,8 @@ logger.info(f"   SECRET: {'✅ Set' if SECRET else '❌ Not set'}")
 logger.info(f"   API_KEY: {'✅ Set' if AIMLAPI_API_KEY else '❌ Not set'}")
 logger.info(f"   BASE_URL: {AIMLAPI_BASE_URL}")
 logger.info(f"   MODEL: {AIMLAPI_MODEL}")
+logger.info(f"   CHROME_BINARY: {CHROME_BINARY}")
+logger.info(f"   CHROMEDRIVER_PATH: {CHROMEDRIVER_PATH}")
 logger.info("="*60)
 
 # Initialize OpenAI client with error handling
@@ -67,17 +73,35 @@ else:
     logger.error("❌ AIMLAPI_API_KEY is not set! LLM features will NOT work!")
 
 def setup_browser():
-    """Initialize headless Chrome browser"""
+    """Initialize headless Chrome browser with robust options and path fallbacks"""
     chrome_options = Options()
-    chrome_options.add_argument("--headless")
+    # Headless + robustness flags
+    chrome_options.add_argument("--headless=new")  # newer headless mode where available
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-    chrome_options.binary_location = "/usr/bin/chromium"
-    
-    service = Service(executable_path="/usr/bin/chromedriver")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--single-process")
+    chrome_options.add_argument("--disable-software-rasterizer")
+    chrome_options.add_argument("--remote-debugging-port=9222")
+
+    # Use environment-provided binary path if available
+    if CHROME_BINARY and os.path.exists(CHROME_BINARY):
+        chrome_options.binary_location = CHROME_BINARY
+
+    # Setup service with provided chromedriver path
+    service_path = CHROMEDRIVER_PATH
+    if not os.path.exists(service_path):
+        # try common alternatives
+        alternatives = ["/usr/bin/chromedriver", "/usr/local/bin/chromedriver"]
+        for alt in alternatives:
+            if os.path.exists(alt):
+                service_path = alt
+                break
+
+    service = Service(executable_path=service_path)
     driver = webdriver.Chrome(service=service, options=chrome_options)
     driver.set_page_load_timeout(30)
     return driver
@@ -86,20 +110,24 @@ def extract_quiz_page(url):
     """Extract quiz content using Selenium with JavaScript rendering"""
     logger.info(f"🌐 Extracting quiz from: {url}")
     driver = setup_browser()
-    
+
     try:
         driver.get(url)
-        time.sleep(5)  # Wait for JavaScript to execute
-        
+        # small explicit wait to allow JS to run and content to stabilise
+        time.sleep(3)
+
         # Wait for body to be present
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
-        
+
         # Get page content after JavaScript execution
-        page_source = driver.page_source
-        page_text = driver.find_element(By.TAG_NAME, "body").text
-        
+        page_source = driver.page_source or ""
+        try:
+            page_text = driver.find_element(By.TAG_NAME, "body").text or ""
+        except Exception:
+            page_text = ""
+
         # Extract all links (for file downloads)
         links = []
         try:
@@ -112,18 +140,18 @@ def extract_quiz_page(url):
                     links.append(absolute_url)
         except Exception as e:
             logger.warning(f"Link extraction error: {e}")
-        
+
         # Extract tables
         tables_html = []
         try:
             table_elements = driver.find_elements(By.TAG_NAME, "table")
             for table in table_elements:
-                tables_html.append(table.get_attribute('outerHTML'))
+                tables_html.append(table.get_attribute('outerHTML') or "")
         except Exception as e:
             logger.warning(f"Table extraction error: {e}")
-        
+
         logger.info(f"✅ Extracted: {len(page_text)} chars, {len(links)} links, {len(tables_html)} tables")
-        
+
         return {
             "html": page_source,
             "text": page_text,
@@ -131,7 +159,7 @@ def extract_quiz_page(url):
             "links": links,
             "url": url
         }
-        
+
     except Exception as e:
         logger.error(f"❌ Extraction error: {str(e)}")
         return {
@@ -143,7 +171,10 @@ def extract_quiz_page(url):
             "error": str(e)
         }
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 def download_file(url):
     """Download file from URL"""
@@ -168,19 +199,25 @@ def parse_pdf(pdf_bytes):
             "text_by_page": [],
             "tables_by_page": []
         }
-        
+
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page_num, page in enumerate(pdf.pages, 1):
                 # Extract text
-                text = page.extract_text()
+                try:
+                    text = page.extract_text()
+                except Exception:
+                    text = None
                 if text:
                     result["text_by_page"].append({
                         "page": page_num,
                         "text": text
                     })
-                
+
                 # Extract tables
-                tables = page.extract_tables()
+                try:
+                    tables = page.extract_tables()
+                except Exception:
+                    tables = None
                 if tables:
                     for table_idx, table in enumerate(tables):
                         if table and len(table) > 0:
@@ -195,10 +232,10 @@ def parse_pdf(pdf_bytes):
                                 })
                             except Exception as e:
                                 logger.warning(f"Table conversion error: {e}")
-        
+
         logger.info(f"✅ Parsed PDF: {len(result['text_by_page'])} pages, {len(result['tables_by_page'])} tables")
         return result
-        
+
     except Exception as e:
         logger.error(f"❌ PDF parsing error: {str(e)}")
         return None
@@ -231,6 +268,9 @@ def parse_excel(excel_bytes):
 
 def extract_submit_url(page_content):
     """Extract submit URL from page content"""
+    if not page_content:
+        return None
+
     # Look for submit URLs in various formats
     patterns = [
         r'Post your answer to\s+(https?://[^\s<>"]+)',
@@ -238,20 +278,58 @@ def extract_submit_url(page_content):
         r'"submit_url":\s*"(https?://[^\s<>"]+)"',
         r'https?://[^\s<>"]+/submit[^\s<>"]*'
     ]
-    
+
     for pattern in patterns:
         match = re.search(pattern, page_content, re.IGNORECASE)
         if match:
             url = match.group(1) if match.lastindex else match.group(0)
             logger.info(f"✅ Found submit URL: {url}")
             return url
-    
+
     logger.warning("⚠️ No submit URL found in page content")
     return None
 
+def _extract_json_from_text(text):
+    """
+    Try to extract the most-likely JSON object from a text blob.
+    Strategy:
+      1. Try direct json.loads(text)
+      2. If fails, find first '{' and last '}' and attempt loads of that slice
+      3. As a fallback, use regex to find the first {...} block
+    Returns parsed object or raises ValueError.
+    """
+    if not text:
+        raise ValueError("No text to parse")
+
+    # 1. direct
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # 2. slice from first { to last }
+    first = text.find('{')
+    last = text.rfind('}')
+    if first != -1 and last != -1 and last > first:
+        candidate = text[first:last+1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    # 3. regex to match a simple {...} block (non-greedy)
+    m = re.search(r'\{[\s\S]*?\}', text)
+    if m:
+        try:
+            return json.loads(m.group())
+        except Exception:
+            pass
+
+    raise ValueError("Could not extract JSON from text")
+
 def solve_quiz_with_llm(quiz_data, email, secret, quiz_url):
     """Use LLM to understand and solve the quiz"""
-    
+
     # Check if client is initialized
     if not client:
         logger.error("❌ LLM client not initialized")
@@ -259,24 +337,26 @@ def solve_quiz_with_llm(quiz_data, email, secret, quiz_url):
             "error": "LLM client not initialized. Check AIMLAPI_API_KEY in secrets.",
             "answer": None
         }
-    
+
     # Prepare context for LLM
     context = {
-        "question": quiz_data["text"][:5000],
+        "question": (quiz_data.get("text") or "")[:5000],
         "available_links": quiz_data.get("links", [])[:10],
         "tables_count": len(quiz_data.get("tables_html", [])),
         "downloaded_files": {}
     }
-    
+
     # Auto-download files mentioned in links
     for link in quiz_data.get("links", [])[:5]:  # Limit to 5 files
         try:
-            file_ext = link.split('.')[-1].lower()
-            
+            parsed_url = urlparse(link)
+            path = parsed_url.path or ""
+            file_ext = path.split('.')[-1].lower() if '.' in path else ''
+            # Fall back to content-type detection after download if needed
             if file_ext in ['pdf', 'csv', 'xlsx', 'xls', 'json', 'txt']:
                 logger.info(f"📥 Auto-downloading: {link}")
                 file_content = download_file(link)
-                
+
                 if file_content:
                     if file_ext == 'pdf':
                         parsed = parse_pdf(file_content)
@@ -291,14 +371,28 @@ def solve_quiz_with_llm(quiz_data, email, secret, quiz_url):
                         if parsed:
                             context["downloaded_files"][f"excel_{link}"] = parsed
                     elif file_ext == 'json':
-                        parsed = json.loads(file_content.decode('utf-8'))
-                        context["downloaded_files"][f"json_{link}"] = parsed
-                        
+                        try:
+                            parsed = json.loads(file_content.decode('utf-8'))
+                        except Exception:
+                            parsed = None
+                        if parsed:
+                            context["downloaded_files"][f"json_{link}"] = parsed
+            else:
+                # If no obvious extension, attempt to download and sniff content-type
+                logger.info(f"📥 Auto-downloading (unknown ext): {link}")
+                file_content = download_file(link)
+                if file_content:
+                    # simple heuristic: check for PDF header
+                    if file_content[:4] == b'%PDF':
+                        parsed = parse_pdf(file_content)
+                        if parsed:
+                            context["downloaded_files"][f"pdf_{link}"] = parsed
         except Exception as e:
             logger.error(f"File processing error for {link}: {e}")
             continue
-    
-    # Create prompt for LLM
+
+    # Create prompt for LLM (trim downloaded_files details to avoid huge prompt)
+    downloaded_summary = list(context["downloaded_files"].keys())
     prompt = f"""You are a data analyst solving a quiz. Analyze the question and data, then provide the answer.
 
 QUESTION:
@@ -306,66 +400,70 @@ QUESTION:
 
 AVAILABLE DATA:
 - Links found: {len(context['available_links'])}
-- Downloaded files: {list(context['downloaded_files'].keys())}
-
-DOWNLOADED FILE DATA:
-{json.dumps(context['downloaded_files'], indent=2)[:8000]}
+- Downloaded files: {downloaded_summary}
 
 TASK:
 1. Read the question carefully
 2. Identify what calculation/analysis is needed
-3. Use the downloaded data to solve it
+3. Use the downloaded data to solve it (if any)
 4. Provide the exact answer in the required format
 
-Respond in JSON format:
+Respond in JSON only (no surrounding explanation). EXACT format:
 {{
-    "answer": the_actual_answer,
-    "reasoning": "step-by-step explanation",
-    "calculation": "show your work",
+    "answer": <the_actual_answer>,
+    "reasoning": "<step-by-step explanation>",
+    "calculation": "<show your work>",
     "answer_type": "number/string/boolean/json"
 }}
 
 IMPORTANT:
 - Be precise with numbers (no rounding unless specified)
-- Follow the exact format requested in the question
-- If the answer is a sum, provide just the number
-- If it's text, provide the exact text"""
+- If the answer is a sum, provide just the number in the 'answer' field
+- If it's text, provide the exact text in the 'answer' field
+"""
 
     try:
         logger.info("🤖 Sending to LLM...")
-        
+
+        # use max_tokens (supported) instead of removed max_completion_tokens
+        # keep temperature low to encourage deterministic answers
         response = client.chat.completions.create(
             model=AIMLAPI_MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a precise data analyst. Always respond with valid JSON containing the answer."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "system", "content": "You are a precise data analyst. Always respond with valid JSON containing the answer."},
+                {"role": "user", "content": prompt}
             ],
             temperature=0.1,
-            max_completion_tokens=4000  # Changed from max_tokens
+            max_tokens=1024
         )
-        
-        response_text = response.choices[0].message.content
-        logger.info(f"🤖 LLM Response: {response_text[:500]}...")
-        
-        # Extract JSON from response
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if json_match:
-            solution = json.loads(json_match.group())
-            logger.info(f"✅ Answer: {solution.get('answer')}")
+
+        # Newer SDK returns choices with .message.content in many wrappers; be defensive
+        response_text = ""
+        try:
+            # common shapes: response.choices[0].message.content
+            response_text = response.choices[0].message.content
+        except Exception:
+            try:
+                # alternate: response.choices[0].text
+                response_text = response.choices[0].text
+            except Exception:
+                # fallback: str(response)
+                response_text = str(response)
+
+        logger.info(f"🤖 LLM Response (truncated): {response_text[:500]}...")
+
+        # Extract JSON robustly
+        try:
+            solution = _extract_json_from_text(response_text)
+            logger.info(f"✅ Answer parsed: {solution.get('answer') if isinstance(solution, dict) else 'N/A'}")
             return solution
-        else:
-            logger.error("❌ Could not parse LLM response as JSON")
+        except Exception as e:
+            logger.error(f"❌ Could not parse LLM response as JSON: {e}")
             return {
-                "error": "Could not parse LLM response",
+                "error": "Could not parse LLM response as JSON",
                 "raw_response": response_text
             }
-            
+
     except Exception as e:
         logger.error(f"❌ LLM error: {str(e)}")
         logger.error(traceback.format_exc())
@@ -379,25 +477,25 @@ def submit_answer(submit_url, email, secret, quiz_url, answer):
         "url": quiz_url,
         "answer": answer
     }
-    
+
     try:
         logger.info(f"📤 Submitting to: {submit_url}")
         logger.info(f"📤 Answer: {json.dumps(answer) if isinstance(answer, (dict, list)) else answer}")
-        
+
         response = requests.post(submit_url, json=payload, timeout=30)
-        
+
         try:
             result = response.json()
             logger.info(f"📥 Response: {result}")
-        except:
+        except Exception:
             result = {
                 "raw_response": response.text,
                 "status_code": response.status_code
             }
             logger.info(f"📥 Raw response: {response.text}")
-        
+
         return result
-        
+
     except Exception as e:
         logger.error(f"❌ Submission error: {str(e)}")
         return {"error": str(e)}
@@ -407,18 +505,18 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
     current_url = initial_url
     results = []
     iteration = 0
-    
+
     while current_url and (time.time() - start_time) < timeout:
         iteration += 1
         logger.info(f"\n{'='*60}")
         logger.info(f"🎯 QUIZ #{iteration}: {current_url}")
         logger.info(f"⏱️  Time elapsed: {time.time() - start_time:.1f}s / {timeout}s")
         logger.info(f"{'='*60}\n")
-        
+
         try:
             # Step 1: Extract quiz page
             quiz_data = extract_quiz_page(current_url)
-            
+
             if quiz_data.get('error'):
                 results.append({
                     "quiz_number": iteration,
@@ -427,24 +525,30 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                     "status": "extraction_failed"
                 })
                 break
-            
+
             # Step 2: Extract submit URL from page
-            submit_url = extract_submit_url(quiz_data['html'] + quiz_data['text'])
-            
+            submit_url = extract_submit_url((quiz_data.get('html') or "") + (quiz_data.get('text') or ""))
+
             # Step 3: Solve with LLM
             solution = solve_quiz_with_llm(quiz_data, email, secret, current_url)
-            
-            if "error" in solution:
+
+            if isinstance(solution, dict) and solution.get("error"):
                 results.append({
                     "quiz_number": iteration,
                     "url": current_url,
                     "error": solution["error"],
-                    "status": "solving_failed"
+                    "status": "solving_failed",
+                    "solution": solution
                 })
                 break
-            
-            answer = solution.get("answer")
-            
+
+            answer = None
+            if isinstance(solution, dict):
+                answer = solution.get("answer")
+            else:
+                # if solution is non-dict, keep it raw
+                answer = solution
+
             if not submit_url or answer is None:
                 results.append({
                     "quiz_number": iteration,
@@ -454,10 +558,10 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                     "status": "incomplete"
                 })
                 break
-            
+
             # Step 4: Submit answer
             submission_result = submit_answer(submit_url, email, secret, current_url, answer)
-            
+
             results.append({
                 "quiz_number": iteration,
                 "url": current_url,
@@ -466,7 +570,7 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                 "status": "submitted",
                 "correct": submission_result.get("correct", False)
             })
-            
+
             # Step 5: Check for next URL
             if submission_result.get("url"):
                 current_url = submission_result["url"]
@@ -474,7 +578,7 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
             else:
                 logger.info("🏁 Quiz chain complete!")
                 break
-                
+
         except Exception as e:
             logger.error(f"❌ Exception in quiz #{iteration}: {str(e)}")
             logger.error(traceback.format_exc())
@@ -486,7 +590,7 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                 "status": "exception"
             })
             break
-    
+
     return results
 
 @app.route('/', methods=['GET'])
@@ -532,29 +636,29 @@ def health_check():
 def quiz_endpoint():
     """Main quiz endpoint - receives quiz tasks"""
     start_time = time.time()
-    
+
     # Validate JSON
     if not request.is_json:
         logger.warning("❌ Received non-JSON request")
         return jsonify({"error": "Invalid JSON"}), 400
-    
+
     data = request.get_json()
     logger.info(f"\n{'='*60}")
     logger.info(f"📨 NEW QUIZ REQUEST")
     logger.info(f"📧 Email: {data.get('email')}")
     logger.info(f"🔗 URL: {data.get('url')}")
     logger.info(f"{'='*60}\n")
-    
+
     # Validate secret
     if data.get("secret") != SECRET:
         logger.warning(f"❌ Invalid secret")
         return jsonify({"error": "Invalid secret"}), 403
-    
+
     # Validate required fields
     if not data.get("email") or not data.get("url"):
         logger.warning("❌ Missing required fields")
         return jsonify({"error": "Missing required fields (email or url)"}), 400
-    
+
     # Check if LLM client is ready
     if not client:
         logger.error("❌ LLM client not initialized")
@@ -562,7 +666,7 @@ def quiz_endpoint():
             "error": "LLM client not initialized. Check AIMLAPI_API_KEY in Space secrets.",
             "time_taken": round(time.time() - start_time, 2)
         }), 500
-    
+
     # Process quiz
     try:
         results = process_quiz_chain(
@@ -571,7 +675,7 @@ def quiz_endpoint():
             data["secret"],
             start_time
         )
-        
+
         response = {
             "status": "completed",
             "results": results,
@@ -579,16 +683,16 @@ def quiz_endpoint():
             "quizzes_correct": sum(1 for r in results if r.get("correct")),
             "time_taken": round(time.time() - start_time, 2)
         }
-        
+
         logger.info(f"\n{'='*60}")
         logger.info(f"✅ QUIZ CHAIN COMPLETED")
         logger.info(f"📊 Attempted: {response['quizzes_attempted']}")
         logger.info(f"✅ Correct: {response['quizzes_correct']}")
         logger.info(f"⏱️  Time: {response['time_taken']}s")
         logger.info(f"{'='*60}\n")
-        
+
         return jsonify(response), 200
-        
+
     except Exception as e:
         logger.error(f"❌ Fatal error: {str(e)}")
         logger.error(traceback.format_exc())
