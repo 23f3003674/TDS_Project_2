@@ -20,10 +20,12 @@ import numpy as np
 from bs4 import BeautifulSoup
 import pdfplumber
 from urllib.parse import urljoin, urlparse
-import tempfile
 import traceback
 
+# Load environment variables
 load_dotenv()
+
+# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -32,14 +34,37 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Configuration
+# Configuration with validation
 EMAIL = os.getenv("STUDENT_EMAIL")
 SECRET = os.getenv("STUDENT_SECRET")
 AIMLAPI_BASE_URL = os.getenv("AIMLAPI_BASE_URL", "https://aipipe.org/openai/v1")
 AIMLAPI_API_KEY = os.getenv("AIMLAPI_API_KEY")
 AIMLAPI_MODEL = os.getenv("AIMLAPI_MODEL", "gpt-5-nano")
 
-client = OpenAI(api_key=AIMLAPI_API_KEY, base_url=AIMLAPI_BASE_URL)
+# Log configuration status
+logger.info("="*60)
+logger.info("🔧 Configuration Status:")
+logger.info(f"   EMAIL: {'✅ Set' if EMAIL else '❌ Not set'}")
+logger.info(f"   SECRET: {'✅ Set' if SECRET else '❌ Not set'}")
+logger.info(f"   API_KEY: {'✅ Set' if AIMLAPI_API_KEY else '❌ Not set'}")
+logger.info(f"   BASE_URL: {AIMLAPI_BASE_URL}")
+logger.info(f"   MODEL: {AIMLAPI_MODEL}")
+logger.info("="*60)
+
+# Initialize OpenAI client with error handling
+client = None
+if AIMLAPI_API_KEY:
+    try:
+        client = OpenAI(
+            api_key=AIMLAPI_API_KEY,
+            base_url=AIMLAPI_BASE_URL
+        )
+        logger.info("✅ OpenAI client initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize OpenAI client: {e}")
+        client = None
+else:
+    logger.error("❌ AIMLAPI_API_KEY is not set! LLM features will NOT work!")
 
 def setup_browser():
     """Initialize headless Chrome browser"""
@@ -226,6 +251,14 @@ def extract_submit_url(page_content):
 
 def solve_quiz_with_llm(quiz_data, email, secret, quiz_url):
     """Use LLM to understand and solve the quiz"""
+    
+    # Check if client is initialized
+    if not client:
+        logger.error("❌ LLM client not initialized")
+        return {
+            "error": "LLM client not initialized. Check AIMLAPI_API_KEY in secrets.",
+            "answer": None
+        }
     
     # Prepare context for LLM
     context = {
@@ -464,6 +497,7 @@ def home():
         "version": "2.0-production",
         "status": "running",
         "model": AIMLAPI_MODEL,
+        "llm_ready": client is not None,
         "features": [
             "✅ JavaScript rendering (Selenium)",
             "✅ Automatic file downloads (PDF/CSV/Excel)",
@@ -488,6 +522,7 @@ def health_check():
         "status": "healthy",
         "model": AIMLAPI_MODEL,
         "base_url": AIMLAPI_BASE_URL,
+        "llm_initialized": client is not None,
         "email_configured": bool(EMAIL),
         "secret_configured": bool(SECRET),
         "api_key_configured": bool(AIMLAPI_API_KEY)
@@ -519,6 +554,14 @@ def quiz_endpoint():
     if not data.get("email") or not data.get("url"):
         logger.warning("❌ Missing required fields")
         return jsonify({"error": "Missing required fields (email or url)"}), 400
+    
+    # Check if LLM client is ready
+    if not client:
+        logger.error("❌ LLM client not initialized")
+        return jsonify({
+            "error": "LLM client not initialized. Check AIMLAPI_API_KEY in Space secrets.",
+            "time_taken": round(time.time() - start_time, 2)
+        }), 500
     
     # Process quiz
     try:
