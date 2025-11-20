@@ -13,7 +13,7 @@ An automated system that solves data analysis quizzes using GPT-5-nano via AIPip
 
 ## Features
 
-- **AI-Powered**: Uses GPT-5-nano for intelligent quiz solving
+- **AI-Powered**: Uses GPT-5-nano for intelligent quiz solving.
 - **Web Scraping**: Selenium-based browser automation
 - **Data Analysis**: Handles PDFs, CSVs, Excel files
 - **Dockerized**: Fully containerized for easy deployment
