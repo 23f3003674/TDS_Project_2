@@ -399,8 +399,8 @@ IMPORTANT:
                 {"role": "system", "content": "You are a precise data analyst. Always respond with valid JSON containing the answer."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.1,
-            max_completion_tokens=1024,
+            #temperature=0.1,
+            #max_completion_tokens=1024,
         )
 
         # Extract content robustly
