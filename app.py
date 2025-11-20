@@ -347,7 +347,7 @@ IMPORTANT:
                 }
             ],
             temperature=0.1,
-            max_tokens=4000
+            max_completion_tokens=4000  # Changed from max_tokens
         )
         
         response_text = response.choices[0].message.content
