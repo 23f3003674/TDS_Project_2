@@ -250,24 +250,30 @@ def parse_excel(excel_bytes):
 # Helpers: URL extraction & JSON extraction
 # -------------------------
 def extract_submit_url(page_content):
-    """Find probable submit URL from page content"""
+    """
+    Extract ONLY TDS quiz submit URLs (the correct ones).
+    Prevent false positives from LLM instructions / code blocks.
+    """
     if not page_content:
         return None
 
+    # Strict pattern: TDS submit URL always ends with:  /submit?id=XXXX  OR  /submit-XXXX
     patterns = [
-        r'Post your answer to\s+(https?://[^\s<>"]+)',
-        r'submit.*?to\s+(https?://[^\s<>"]+)',
-        r'"submit_url":\s*"(https?://[^\s<>"]+)"',
-        r'https?://[^\s<>"]+/submit[^\s<>"]*',
+        r'(https?://[^\s"<>]+/submit[^\s"<>]+)',
+        r'(https?://tds-llm-analysis\.s-anand\.net/[^\s"<>]*submit[^\s"<>]*)'
     ]
+
     for pattern in patterns:
-        match = re.search(pattern, page_content, re.IGNORECASE)
-        if match:
-            url = match.group(1) if match.lastindex else match.group(0)
-            logger.info(f"✅ Found submit URL: {url}")
-            return url
-    logger.warning("⚠️ No submit URL found in page content")
+        matches = re.findall(pattern, page_content, flags=re.IGNORECASE)
+        if matches:
+            # Pick longest match (avoid truncated)
+            best = max(matches, key=len)
+            logger.info(f"✅ Found submit URL: {best}")
+            return best
+
+    logger.warning("⚠️ No REAL submit URL found")
     return None
+
 
 
 def _extract_json_from_text(text):
