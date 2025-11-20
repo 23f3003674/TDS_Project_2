@@ -400,7 +400,7 @@ IMPORTANT:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,
-            max_tokens=1024,
+            max_completion_tokens=1024,
         )
 
         # Extract content robustly
