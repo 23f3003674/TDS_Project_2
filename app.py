@@ -384,7 +384,7 @@ Examples:
                     "content": prompt
                 }
             ],
-            temperature=0.1,
+            #temperature=0.1,
         )
         
         response_text = response.choices[0].message.content.strip()
