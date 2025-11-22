@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Enhanced app.py with improved LLM prompting and error handling
+Fully Dynamic Quiz Solver - NO HARDCODING
+Handles any quiz type dynamically
 """
 
 import os
@@ -10,7 +11,7 @@ import requests
 import re
 import io
 import traceback
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from flask import Flask, request, jsonify
 from selenium import webdriver
@@ -25,6 +26,7 @@ from dotenv import load_dotenv
 
 import logging
 import pandas as pd
+import numpy as np
 from bs4 import BeautifulSoup
 import pdfplumber
 
@@ -61,7 +63,7 @@ else:
 
 
 def setup_browser():
-    """Initialize headless Chrome with better settings"""
+    """Initialize headless Chrome"""
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
@@ -71,7 +73,7 @@ def setup_browser():
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option('useAutomationExtension', False)
-    opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
     
     if CHROME_BINARY and os.path.exists(CHROME_BINARY):
         opts.binary_location = CHROME_BINARY
@@ -82,8 +84,11 @@ def setup_browser():
     return driver
 
 
-def extract_quiz_page(url):
-    """Extract quiz content with better waiting"""
+def extract_page_content(url, max_wait=7):
+    """
+    Extract content from any webpage - FULLY DYNAMIC
+    No assumptions about page structure
+    """
     logger.info(f"🌐 Extracting: {url}")
     driver = setup_browser()
     
@@ -95,36 +100,35 @@ def extract_quiz_page(url):
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
         
-        # Wait longer for JavaScript to execute
-        time.sleep(5)  # Increased from 3 to 5 seconds
-        
-        # Try to wait for common result containers
-        for selector in ["#result", ".content", ".quiz-content", "#question", ".question"]:
-            try:
-                WebDriverWait(driver, 3).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                )
-                logger.info(f"✅ Found element: {selector}")
+        # Progressive waiting - check if content stabilizes
+        previous_text = ""
+        for i in range(max_wait):
+            time.sleep(1)
+            current_text = driver.find_element(By.TAG_NAME, "body").text
+            
+            # If content hasn't changed for 2 seconds, assume it's loaded
+            if i > 2 and current_text == previous_text and len(current_text) > 50:
+                logger.info(f"✅ Content stabilized after {i}s")
                 break
-            except:
-                pass
+            
+            previous_text = current_text
         
-        # Additional wait to ensure all JS has executed
-        time.sleep(2)
+        # Final wait to be safe
+        time.sleep(1)
         
+        # Get all content
         page_source = driver.page_source
         page_text = driver.find_element(By.TAG_NAME, "body").text
         
-        # Also try to execute JavaScript to get any dynamically loaded content
+        # Try JavaScript extraction as fallback
         try:
-            js_content = driver.execute_script("return document.body.innerText;")
-            if js_content and len(js_content) > len(page_text):
-                page_text = js_content
-                logger.info("✅ Used JavaScript to get inner text")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not execute JS: {e}")
+            js_text = driver.execute_script("return document.body.innerText;")
+            if js_text and len(js_text) > len(page_text):
+                page_text = js_text
+        except:
+            pass
         
-        # Extract all links with better filtering
+        # Extract ALL links (don't filter)
         links = []
         for link in driver.find_elements(By.TAG_NAME, "a"):
             href = link.get_attribute("href")
@@ -134,7 +138,6 @@ def extract_quiz_page(url):
                     links.append(absolute_url)
         
         logger.info(f"✅ Extracted: {len(page_text)} chars, {len(links)} links")
-        logger.info(f"📝 Preview: {page_text[:200]}")
         
         return {
             "html": page_source,
@@ -158,91 +161,116 @@ def extract_quiz_page(url):
             pass
 
 
-def download_file(url):
-    """Download file with retry logic"""
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"📥 Downloading (attempt {attempt+1}): {url}")
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
-            resp = requests.get(url, headers=headers, timeout=30)
-            resp.raise_for_status()
-            logger.info(f"✅ Downloaded {len(resp.content)} bytes")
-            return resp.content
-        except Exception as e:
-            logger.warning(f"⚠️ Download attempt {attempt+1} failed: {e}")
-            if attempt == max_retries - 1:
-                logger.error(f"❌ Download failed after {max_retries} attempts")
-                return None
-            time.sleep(2)
-    return None
+def download_file(url, timeout=30):
+    """Download any file"""
+    try:
+        logger.info(f"📥 Downloading: {url}")
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        logger.info(f"✅ Downloaded {len(resp.content)} bytes")
+        return resp.content
+    except Exception as e:
+        logger.error(f"❌ Download error: {e}")
+        return None
+
+
+def smart_parse_file(file_content, url):
+    """
+    Intelligently parse any file type - FULLY DYNAMIC
+    No assumptions about content structure
+    """
+    result = {"type": "unknown", "content": None, "error": None}
+    
+    try:
+        # Detect file type
+        if file_content[:4] == b"%PDF":
+            result["type"] = "pdf"
+            result["content"] = parse_pdf(file_content)
+        
+        elif url.lower().endswith('.csv') or b',' in file_content[:500]:
+            result["type"] = "csv"
+            result["content"] = parse_csv(file_content)
+        
+        elif url.lower().endswith(('.xlsx', '.xls')):
+            result["type"] = "excel"
+            result["content"] = parse_excel(file_content)
+        
+        elif url.lower().endswith('.json') or file_content[:1] in [b'{', b'[']:
+            result["type"] = "json"
+            try:
+                result["content"] = json.loads(file_content.decode('utf-8'))
+            except:
+                result["error"] = "Invalid JSON"
+        
+        else:
+            # Try as text
+            result["type"] = "text"
+            try:
+                result["content"] = file_content.decode('utf-8')
+            except:
+                result["error"] = "Could not decode as text"
+        
+        logger.info(f"✅ Parsed as: {result['type']}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Parse error: {e}")
+        result["error"] = str(e)
+        return result
 
 
 def parse_pdf(pdf_bytes):
-    """Parse PDF with comprehensive table extraction"""
+    """Parse PDF - extract ALL text and tables dynamically"""
     try:
-        logger.info("📄 Parsing PDF...")
         result = {
-            "text_by_page": [],
-            "tables_by_page": [],
+            "pages": [],
             "all_text": "",
             "all_tables": []
         }
         
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page_num, page in enumerate(pdf.pages, 1):
+                page_data = {"page_number": page_num}
+                
                 # Extract text
                 text = page.extract_text()
                 if text:
-                    result["text_by_page"].append({
-                        "page": page_num,
-                        "text": text
-                    })
+                    page_data["text"] = text
                     result["all_text"] += f"\n--- Page {page_num} ---\n{text}"
                 
                 # Extract tables
                 tables = page.extract_tables()
                 if tables:
+                    page_data["tables"] = []
                     for table_idx, table in enumerate(tables):
                         if table and len(table) > 0:
                             try:
-                                # Create DataFrame
-                                if len(table) > 1:
-                                    df = pd.DataFrame(table[1:], columns=table[0])
-                                else:
-                                    df = pd.DataFrame(table)
-                                
-                                # Clean column names
-                                df.columns = [str(col).strip() if col else f"col_{i}" 
-                                            for i, col in enumerate(df.columns)]
-                                
+                                df = pd.DataFrame(table[1:], columns=table[0])
                                 table_info = {
-                                    "page": page_num,
-                                    "table_index": table_idx,
-                                    "dataframe": df.to_dict('records'),
-                                    "columns": list(df.columns),
-                                    "shape": df.shape,
-                                    "summary": df.describe().to_dict() if df.select_dtypes(include='number').shape[1] > 0 else None
+                                    "index": table_idx,
+                                    "data": df.to_dict('records'),
+                                    "shape": df.shape
                                 }
-                                
-                                result["tables_by_page"].append(table_info)
-                                result["all_tables"].append(table_info)
-                                
-                                logger.info(f"  Table on page {page_num}: {df.shape}")
-                            except Exception as e:
-                                logger.warning(f"  Could not parse table: {e}")
+                                page_data["tables"].append(table_info)
+                                result["all_tables"].append({
+                                    "page": page_num,
+                                    **table_info
+                                })
+                            except:
+                                pass
+                
+                result["pages"].append(page_data)
         
-        logger.info(f"✅ PDF: {len(result['text_by_page'])} pages, {len(result['all_tables'])} tables")
+        logger.info(f"✅ PDF: {len(result['pages'])} pages, {len(result['all_tables'])} tables")
         return result
     except Exception as e:
-        logger.error(f"❌ PDF parsing error: {e}")
-        return None
+        logger.error(f"❌ PDF error: {e}")
+        return {"error": str(e)}
 
 
 def parse_csv(csv_content):
-    """Parse CSV with better error handling"""
+    """Parse CSV - handle ANY structure dynamically"""
     try:
         if isinstance(csv_content, bytes):
             csv_content = csv_content.decode("utf-8")
@@ -252,147 +280,161 @@ def parse_csv(csv_content):
         # Clean column names
         df.columns = [str(col).strip() for col in df.columns]
         
-        logger.info(f"✅ CSV: {df.shape[0]} rows × {df.shape[1]} columns")
-        logger.info(f"  Columns: {list(df.columns)}")
+        # Analyze ALL columns dynamically
+        column_analysis = {}
+        for col in df.columns:
+            col_data = df[col]
+            analysis = {
+                "dtype": str(col_data.dtype),
+                "non_null_count": col_data.notna().sum(),
+                "null_count": col_data.isna().sum()
+            }
+            
+            # If numeric, provide stats
+            if pd.api.types.is_numeric_dtype(col_data):
+                analysis.update({
+                    "sum": float(col_data.sum()),
+                    "mean": float(col_data.mean()),
+                    "min": float(col_data.min()),
+                    "max": float(col_data.max()),
+                    "std": float(col_data.std()) if len(col_data) > 1 else 0
+                })
+                logger.info(f"  '{col}': sum={analysis['sum']}, mean={analysis['mean']:.2f}")
+            else:
+                # For non-numeric, provide unique values
+                unique_vals = col_data.unique()
+                analysis["unique_count"] = len(unique_vals)
+                analysis["sample_values"] = unique_vals[:5].tolist()
+            
+            column_analysis[col] = analysis
         
-        return {
-            "data": df.to_dict('records'),
-            "columns": list(df.columns),
+        result = {
             "shape": df.shape,
-            "summary": df.describe().to_dict() if df.select_dtypes(include='number').shape[1] > 0 else None
+            "row_count": len(df),
+            "columns": list(df.columns),
+            "column_analysis": column_analysis,
+            "first_10_rows": df.head(10).to_dict('records'),
+            "last_10_rows": df.tail(10).to_dict('records')
         }
+        
+        logger.info(f"✅ CSV: {df.shape[0]} rows × {df.shape[1]} columns")
+        return result
     except Exception as e:
-        logger.error(f"❌ CSV parsing error: {e}")
-        return None
+        logger.error(f"❌ CSV error: {e}")
+        return {"error": str(e)}
 
 
-def extract_submit_url(page_content, quiz_url):
-    """Extract submit URL with multiple strategies"""
-    if not page_content:
+def parse_excel(excel_bytes):
+    """Parse Excel files"""
+    try:
+        dfs = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=None)
+        
+        result = {"sheets": {}}
+        for sheet_name, df in dfs.items():
+            # Use same analysis as CSV
+            csv_str = df.to_csv(index=False)
+            result["sheets"][sheet_name] = parse_csv(csv_str.encode())
+        
+        logger.info(f"✅ Excel: {len(result['sheets'])} sheets")
+        return result
+    except Exception as e:
+        logger.error(f"❌ Excel error: {e}")
+        return {"error": str(e)}
+
+
+def extract_submit_url(content, base_url):
+    """
+    Dynamically extract submit URL - NO HARDCODING
+    Looks for any URL containing 'submit'
+    """
+    if not content:
         return None
     
-    # Try multiple patterns
-    patterns = [
-        r'Post your answer to\s+(https?://[^\s<>"]+/submit[^\s<>"]*)',
-        r'submit.*?to\s+(https?://[^\s<>"]+/submit[^\s<>"]*)',
-        r'(https://tds-llm-analysis\.s-anand\.net/submit[^\s<>"]*)',
-        r'(https?://[^\s<>"]+/submit[^\s<>"]*)',
+    # Find ALL URLs in content
+    url_patterns = [
+        r'(https?://[^\s<>"\']+)',
+        r'href=["\']([^"\']+)["\']',
+        r'to\s+(https?://[^\s<>"]+)',
     ]
     
-    for pattern in patterns:
-        matches = re.findall(pattern, page_content, flags=re.IGNORECASE | re.DOTALL)
-        if matches:
-            url = matches[0].strip()
-            logger.info(f"✅ Found submit URL: {url}")
-            return url
+    found_urls = []
+    for pattern in url_patterns:
+        matches = re.findall(pattern, content, flags=re.IGNORECASE)
+        found_urls.extend(matches)
     
-    # Fallback to base URL if mentioned
-    if 'submit' in page_content.lower():
-        base_url = 'https://tds-llm-analysis.s-anand.net/submit'
-        logger.info(f"⚠️ Using fallback submit URL: {base_url}")
-        return base_url
+    # Filter for submit URLs
+    submit_urls = [url for url in found_urls if 'submit' in url.lower()]
+    
+    if submit_urls:
+        # Pick the most complete URL
+        submit_url = max(submit_urls, key=len)
+        logger.info(f"✅ Found submit URL: {submit_url}")
+        return submit_url
+    
+    # If no absolute URL found, try to construct from base
+    if '/submit' in content.lower():
+        parsed = urlparse(base_url)
+        submit_url = f"{parsed.scheme}://{parsed.netloc}/submit"
+        logger.info(f"⚠️ Constructed submit URL: {submit_url}")
+        return submit_url
     
     logger.warning("❌ No submit URL found")
     return None
 
 
-def solve_quiz_with_llm(quiz_data, email, secret, quiz_url):
-    """Solve quiz with enhanced LLM prompting"""
+def solve_with_llm(quiz_page, downloaded_files, quiz_url):
+    """
+    Solve quiz with LLM - FULLY DYNAMIC
+    No assumptions about question type or answer format
+    """
     if not client:
         return {"error": "LLM not initialized"}
     
-    # Extract the rendered page text (important for JS-rendered content)
-    page_text = quiz_data.get("text", "")
-    page_html = quiz_data.get("html", "")
+    page_text = quiz_page.get("text", "")
     
-    logger.info(f"📄 Page text length: {len(page_text)}")
-    logger.info(f"📄 First 500 chars: {page_text[:500]}")
+    logger.info(f"📄 Analyzing: {len(page_text)} chars of question")
+    logger.info(f"📄 With {len(downloaded_files)} data files")
     
-    # Download and parse all linked data
-    downloaded_data = {}
-    data_links = [l for l in quiz_data.get("links", [])[:10] 
-                  if not ('submit' in l.lower() and 'data' not in l.lower())]
+    # Build comprehensive context
+    context = {
+        "question_page": {
+            "text": page_text[:5000],
+            "url": quiz_url
+        },
+        "data_files": downloaded_files
+    }
     
-    for link in data_links:
-        try:
-            file_content = download_file(link)
-            if not file_content:
-                continue
-            
-            # Determine file type and parse
-            if file_content[:4] == b"%PDF":
-                parsed = parse_pdf(file_content)
-                if parsed:
-                    downloaded_data[link] = {
-                        "type": "pdf",
-                        "content": parsed
-                    }
-            elif link.lower().endswith('.csv') or b',' in file_content[:200]:
-                parsed = parse_csv(file_content)
-                if parsed:
-                    downloaded_data[link] = {
-                        "type": "csv",
-                        "content": parsed
-                    }
-            elif link.lower().endswith('.json'):
-                try:
-                    parsed = json.loads(file_content.decode('utf-8'))
-                    downloaded_data[link] = {
-                        "type": "json",
-                        "content": parsed
-                    }
-                except:
-                    pass
-            else:
-                try:
-                    text = file_content.decode('utf-8')
-                    downloaded_data[link] = {
-                        "type": "text",
-                        "content": text[:5000]
-                    }
-                except:
-                    pass
-                    
-        except Exception as e:
-            logger.error(f"Error processing {link}: {e}")
-    
-    # Create comprehensive prompt
-    prompt = f"""You are a data analyst solving a quiz. The quiz question is displayed on a webpage that may have been rendered by JavaScript.
+    # Create adaptive prompt - NO ASSUMPTIONS
+    prompt = f"""You are solving a data analysis quiz. Analyze the question and data to determine the correct answer.
 
-RENDERED PAGE CONTENT (what the user sees in browser):
-{page_text[:5000]}
+QUESTION PAGE:
+{page_text[:4000]}
 
-QUESTION/INSTRUCTIONS EXTRACTED:
-{page_text[:5000]}
-
-DOWNLOADED DATA FILES:
-{json.dumps(downloaded_data, indent=2, default=str)[:10000]}
+AVAILABLE DATA:
+{json.dumps(downloaded_files, indent=2, default=str)[:15000]}
 
 INSTRUCTIONS:
-1. READ the rendered page content carefully - it contains the actual question
-2. If the question asks you to extract something from the PAGE ITSELF (like a code, number, or text displayed on the page), find it in the "RENDERED PAGE CONTENT" above
-3. If the question asks you to download and analyze a file, use the "DOWNLOADED DATA FILES" section
-4. If the question asks you to scrape or extract information, look for it in the rendered content first
-5. Calculate or extract the exact answer requested
-6. Return the answer in the correct format (number, string, boolean, etc.)
+1. Carefully read what the question is asking for
+2. Identify what data or information is needed
+3. Use the provided data to calculate/extract the answer
+4. Return the answer in the format requested by the question
 
-CRITICAL:
-- Empty strings "" are usually WRONG - find the actual answer
-- If you see text like "secret code is XXX" or "the answer is YYY", extract XXX or YYY
-- Numbers should be returned as integers or floats, not strings
-- Text/strings should be returned as strings
-- Look for patterns like: "The secret is:", "Answer:", "Code:", etc.
+RULES:
+- The answer MUST come from analyzing the actual data provided
+- DO NOT use example values or placeholders from the question itself
+- If question asks for a calculation (sum, count, average), perform it on the actual data
+- If question asks to scrape/extract something, look in the scraped data
+- Match the answer type to what's requested (number, string, boolean, object)
+- Be precise and exact
 
-Your response MUST be ONLY valid JSON (no markdown, no explanation):
+Return ONLY valid JSON (no markdown):
 {{
-    "answer": <the_actual_answer_here>,
-    "reasoning": "brief explanation of where/how you found the answer"
+    "answer": <calculated_or_extracted_answer>,
+    "reasoning": "how you determined this answer",
+    "confidence": "high/medium/low"
 }}
 
-Examples:
-- If page says "The secret code is ABC123", return: {{"answer": "ABC123", "reasoning": "Found in rendered page text"}}
-- If sum is 12345, return: {{"answer": 12345, "reasoning": "Calculated sum from table"}}
-- If yes/no, return: {{"answer": true, "reasoning": "..."}}"""""
+CRITICAL: Your answer MUST be based on the actual data, not examples in the question."""
 
     try:
         logger.info("🤖 Querying LLM...")
@@ -400,74 +442,60 @@ Examples:
         response = client.chat.completions.create(
             model=AIMLAPI_MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a precise data analyst. Respond ONLY with valid JSON containing 'answer' and 'reasoning' fields. No markdown formatting."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "system", "content": "You are a data analyst. Analyze data carefully and return valid JSON only."},
+                {"role": "user", "content": prompt}
             ],
             #temperature=0.1,
         )
         
         response_text = response.choices[0].message.content.strip()
-        logger.info(f"🤖 LLM Response: {response_text[:300]}")
+        logger.info(f"🤖 LLM response: {response_text[:300]}")
         
-        # Parse JSON response
+        # Parse JSON
+        response_text = re.sub(r'```json\s*|\s*```', '', response_text)
+        
         try:
-            # Remove markdown code blocks if present
-            response_text = re.sub(r'```json\s*|\s*```', '', response_text)
             solution = json.loads(response_text)
-        except json.JSONDecodeError:
-            # Try to extract JSON object
-            match = re.search(r'\{[^{}]*"answer"[^{}]*\}', response_text, re.DOTALL)
+        except:
+            match = re.search(r'\{.*?"answer".*?\}', response_text, re.DOTALL)
             if match:
                 solution = json.loads(match.group())
             else:
-                return {
-                    "error": "Could not parse LLM response as JSON",
-                    "raw_response": response_text
-                }
+                return {"error": "Could not parse LLM response", "raw": response_text}
         
         if "answer" not in solution:
-            return {
-                "error": "LLM response missing 'answer' field",
-                "raw_response": response_text
-            }
+            return {"error": "No answer in response", "raw": response_text}
         
-        answer = solution.get("answer")
+        answer = solution["answer"]
         
-        # Validate answer - don't allow empty strings for most cases
-        if answer == "" or answer is None:
-            logger.warning("⚠️ LLM returned empty answer, retrying with stricter prompt...")
+        # Validate answer is not empty/null
+        if answer == "" or answer is None or answer == "N/A":
+            logger.warning("⚠️ LLM returned empty/null answer, attempting retry...")
             
-            # Retry with more explicit instruction
-            retry_prompt = f"""CRITICAL: You returned an empty answer which is incorrect.
+            # Retry with more explicit prompt
+            retry_prompt = f"""The previous attempt returned an invalid answer.
 
-Look at this content again and find the actual answer:
+QUESTION:
+{page_text[:2000]}
 
-{page_text[:3000]}
+DATA:
+{json.dumps(downloaded_files, indent=2, default=str)[:10000]}
 
-The answer is DEFINITELY in the content above. Look for:
-- Text after "secret", "code", "answer", "result"
-- Numbers, values, or strings clearly displayed
-- Any emphasized or highlighted text
+The answer MUST be extractable from the data above. Look carefully for:
+- Numbers to calculate (sum, count, average, etc.)
+- Text to extract (codes, secrets, names, etc.)
+- Values to identify
 
-Return valid JSON with the actual answer:
-{{
-    "answer": <actual_answer_not_empty>,
-    "reasoning": "where exactly I found it"
-}}"""
+Return valid JSON with the actual answer (not empty/null):
+{{"answer": <actual_value>, "reasoning": "where I found it"}}"""
 
             retry_response = client.chat.completions.create(
                 model=AIMLAPI_MODEL,
                 messages=[
-                    {"role": "system", "content": "Extract the answer from the content. Do not return empty strings."},
+                    {"role": "system", "content": "Return the actual answer from the data, not placeholders."},
                     {"role": "user", "content": retry_prompt}
                 ],
-                #temperature=0.1,
+                #temperature=0.2,
             )
             
             retry_text = retry_response.choices[0].message.content.strip()
@@ -480,7 +508,7 @@ Return valid JSON with the actual answer:
             except:
                 logger.error("❌ Retry also failed")
         
-        logger.info(f"✅ Final answer: {solution.get('answer')}")
+        logger.info(f"✅ Final answer: {answer} (confidence: {solution.get('confidence', 'unknown')})")
         return solution
         
     except Exception as e:
@@ -490,7 +518,7 @@ Return valid JSON with the actual answer:
 
 
 def submit_answer(submit_url, email, secret, quiz_url, answer):
-    """Submit answer with retry logic"""
+    """Submit answer"""
     payload = {
         "email": email,
         "secret": secret,
@@ -498,44 +526,28 @@ def submit_answer(submit_url, email, secret, quiz_url, answer):
         "answer": answer
     }
     
-    max_retries = 3
-    for attempt in range(max_retries):
+    try:
+        logger.info(f"📤 Submitting to: {submit_url}")
+        logger.info(f"📤 Answer: {json.dumps(answer) if isinstance(answer, (dict, list)) else answer}")
+        
+        resp = requests.post(submit_url, json=payload, timeout=30)
+        
+        logger.info(f"📥 Status: {resp.status_code}")
+        
         try:
-            logger.info(f"📤 Submitting (attempt {attempt+1}) to: {submit_url}")
-            logger.info(f"📤 Payload: {json.dumps(payload, indent=2)}")
-            
-            resp = requests.post(submit_url, json=payload, timeout=30)
-            
-            logger.info(f"📥 Status: {resp.status_code}")
-            
-            try:
-                result = resp.json()
-                logger.info(f"📥 Response: {json.dumps(result, indent=2)}")
-                return result
-            except:
-                result = {
-                    "raw": resp.text,
-                    "status": resp.status_code,
-                    "error": "Could not parse response as JSON"
-                }
-                return result
-                
-        except requests.exceptions.Timeout:
-            logger.warning(f"⚠️ Timeout on attempt {attempt+1}")
-            if attempt == max_retries - 1:
-                return {"error": "Submission timeout after retries"}
-            time.sleep(2)
-        except Exception as e:
-            logger.error(f"❌ Submit error: {e}")
-            if attempt == max_retries - 1:
-                return {"error": str(e)}
-            time.sleep(2)
-    
-    return {"error": "Failed after all retries"}
+            result = resp.json()
+            logger.info(f"📥 Result: {json.dumps(result, indent=2)}")
+        except:
+            result = {"raw": resp.text, "status": resp.status_code}
+        
+        return result
+    except Exception as e:
+        logger.error(f"❌ Submit error: {e}")
+        return {"error": str(e)}
 
 
 def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
-    """Process chain of quizzes"""
+    """Process quiz chain - FULLY DYNAMIC"""
     current_url = initial_url
     results = []
     iteration = 0
@@ -553,21 +565,19 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
         
         try:
             # Extract quiz page
-            quiz_data = extract_quiz_page(current_url)
-            if quiz_data.get("error"):
+            quiz_page = extract_page_content(current_url)
+            if quiz_page.get("error"):
                 results.append({
                     "quiz_number": iteration,
                     "url": current_url,
-                    "error": quiz_data["error"],
+                    "error": quiz_page["error"],
                     "status": "extraction_failed"
                 })
                 break
             
-            # Find submit URL
-            submit_url = extract_submit_url(
-                quiz_data.get("html", "") + "\n" + quiz_data.get("text", ""),
-                current_url
-            )
+            # Find submit URL dynamically
+            combined_content = quiz_page.get("html", "") + "\n" + quiz_page.get("text", "")
+            submit_url = extract_submit_url(combined_content, current_url)
             
             if not submit_url:
                 results.append({
@@ -578,15 +588,41 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                 })
                 break
             
+            # Process ALL linked files/pages dynamically
+            downloaded_files = {}
+            for link in quiz_page.get("links", []):
+                # Skip submit URLs
+                if 'submit' in link.lower() and 'data' not in link.lower():
+                    continue
+                
+                # Decide: scrape or download?
+                parsed_link = urlparse(link)
+                file_ext = parsed_link.path.split('.')[-1].lower() if '.' in parsed_link.path else ''
+                
+                # If has common file extension, download
+                if file_ext in ['pdf', 'csv', 'json', 'xlsx', 'xls', 'txt']:
+                    file_content = download_file(link)
+                    if file_content:
+                        parsed = smart_parse_file(file_content, link)
+                        downloaded_files[link] = parsed
+                else:
+                    # Otherwise scrape (might be another page with data)
+                    logger.info(f"🌐 Scraping linked page: {link}")
+                    scraped = extract_page_content(link)
+                    if not scraped.get("error"):
+                        downloaded_files[link] = {
+                            "type": "scraped_page",
+                            "content": scraped.get("text", "")
+                        }
+            
             # Solve with LLM
-            solution = solve_quiz_with_llm(quiz_data, email, secret, current_url)
+            solution = solve_with_llm(quiz_page, downloaded_files, current_url)
             
             if "error" in solution:
                 results.append({
                     "quiz_number": iteration,
                     "url": current_url,
                     "error": solution.get("error"),
-                    "raw_response": solution.get("raw_response"),
                     "status": "solving_failed"
                 })
                 break
@@ -596,13 +632,12 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                 results.append({
                     "quiz_number": iteration,
                     "url": current_url,
-                    "error": "No answer extracted from LLM",
-                    "solution": solution,
+                    "error": "No answer from LLM",
                     "status": "no_answer"
                 })
                 break
             
-            # Submit answer
+            # Submit
             submission = submit_answer(submit_url, email, secret, current_url, answer)
             
             is_correct = submission.get("correct", False)
@@ -616,23 +651,22 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                 "correct": is_correct
             })
             
-            # Check for next quiz
+            # Next quiz?
             next_url = submission.get("url")
             if next_url:
                 current_url = next_url
-                logger.info(f"➡️  Moving to next quiz: {current_url}")
+                logger.info(f"➡️  Next: {current_url}")
             else:
-                logger.info("🏁 Quiz chain completed!")
+                logger.info("🏁 Complete!")
                 break
                 
         except Exception as e:
-            logger.error(f"❌ Exception in quiz {iteration}: {e}")
+            logger.error(f"❌ Exception: {e}")
             logger.error(traceback.format_exc())
             results.append({
                 "quiz_number": iteration,
                 "url": current_url,
                 "error": str(e),
-                "traceback": traceback.format_exc(),
                 "status": "exception"
             })
             break
@@ -643,15 +677,16 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "service": "LLM Quiz Solver",
-        "version": "2.0",
+        "service": "Dynamic Quiz Solver",
+        "version": "3.0",
         "status": "running",
         "model": AIMLAPI_MODEL,
-        "llm_ready": client is not None,
-        "endpoints": {
-            "health": "/health",
-            "quiz": "/quiz (POST)"
-        }
+        "features": [
+            "Zero hardcoding",
+            "Dynamic file parsing",
+            "Adaptive LLM prompting",
+            "Smart scraping detection"
+        ]
     }), 200
 
 
@@ -671,32 +706,21 @@ def quiz_endpoint():
     """Main webhook endpoint"""
     start_time = time.time()
     
-    # Validate JSON
     if not request.is_json:
-        logger.warning("❌ Invalid JSON received")
         return jsonify({"error": "Invalid JSON"}), 400
     
     data = request.get_json()
-    logger.info(f"📨 Received request: {json.dumps(data, indent=2)}")
     
-    # Validate secret
     if data.get("secret") != SECRET:
-        logger.warning("❌ Invalid secret")
         return jsonify({"error": "Invalid secret"}), 403
     
-    # Validate required fields
     if not data.get("email") or not data.get("url"):
-        logger.warning("❌ Missing required fields")
         return jsonify({"error": "Missing email or url"}), 400
     
-    # Check LLM
     if not client:
-        logger.error("❌ LLM not initialized")
         return jsonify({"error": "LLM not initialized"}), 500
     
     try:
-        logger.info("🚀 Starting quiz chain processing...")
-        
         results = process_quiz_chain(
             data["url"],
             data["email"],
@@ -709,10 +733,7 @@ def quiz_endpoint():
         num_correct = sum(1 for r in results if r.get("correct"))
         
         logger.info(f"\n{'='*70}")
-        logger.info(f"✅ COMPLETED")
-        logger.info(f"   Quizzes attempted: {len(results)}")
-        logger.info(f"   Correct: {num_correct}")
-        logger.info(f"   Time: {total_time:.2f}s")
+        logger.info(f"✅ COMPLETED: {num_correct}/{len(results)} correct in {total_time:.2f}s")
         logger.info(f"{'='*70}")
         
         return jsonify({
@@ -721,25 +742,20 @@ def quiz_endpoint():
             "summary": {
                 "quizzes_attempted": len(results),
                 "quizzes_correct": num_correct,
-                "time_taken": round(total_time, 2),
-                "success_rate": f"{num_correct}/{len(results)}"
+                "time_taken": round(total_time, 2)
             }
         }), 200
         
     except Exception as e:
-        logger.error(f"❌ Fatal error: {e}")
+        logger.error(f"❌ Fatal: {e}")
         logger.error(traceback.format_exc())
         return jsonify({
             "error": str(e),
-            "traceback": traceback.format_exc(),
             "time_taken": round(time.time() - start_time, 2)
         }), 500
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 7860))
-    logger.info(f"🚀 Starting server on port {port}")
-    logger.info(f"   Model: {AIMLAPI_MODEL}")
-    logger.info(f"   Email: {EMAIL}")
-    logger.info(f"   LLM Ready: {client is not None}")
+    logger.info(f"🚀 Dynamic Quiz Solver starting on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
