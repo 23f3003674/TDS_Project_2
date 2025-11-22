@@ -345,16 +345,18 @@ def parse_excel(excel_bytes):
 def extract_submit_url(content, base_url):
     """
     Dynamically extract submit URL - NO HARDCODING
-    Looks for any URL containing 'submit'
+    Looks for any URL containing 'submit' and converts relative URLs to absolute
     """
     if not content:
         return None
     
-    # Find ALL URLs in content
+    # Find ALL URLs in content (absolute and relative)
     url_patterns = [
-        r'(https?://[^\s<>"\']+)',
-        r'href=["\']([^"\']+)["\']',
-        r'to\s+(https?://[^\s<>"]+)',
+        r'(https?://[^\s<>"\']+)',  # Absolute URLs
+        r'href=["\']([^"\']+)["\']',  # href attributes
+        r'to\s+(https?://[^\s<>"]+)',  # "to https://..."
+        r'POST[^\n]*to[^\n]*(https?://[^\s<>"]+)',  # POST ... to URL
+        r'(?:POST|post)[^\n]*?([/\w-]+/submit[^\s<>"\']*)',  # Relative submit paths
     ]
     
     found_urls = []
@@ -362,20 +364,31 @@ def extract_submit_url(content, base_url):
         matches = re.findall(pattern, content, flags=re.IGNORECASE)
         found_urls.extend(matches)
     
-    # Filter for submit URLs
-    submit_urls = [url for url in found_urls if 'submit' in url.lower()]
+    # Filter for submit URLs and convert relative to absolute
+    submit_urls = []
+    for url in found_urls:
+        if 'submit' in url.lower():
+            # If it's a relative URL (starts with / or doesn't have http)
+            if url.startswith('/') or not url.startswith('http'):
+                # Convert to absolute URL using base_url
+                parsed_base = urlparse(base_url)
+                absolute_url = f"{parsed_base.scheme}://{parsed_base.netloc}{url if url.startswith('/') else '/' + url}"
+                submit_urls.append(absolute_url)
+                logger.info(f"🔗 Converted relative URL: {url} → {absolute_url}")
+            else:
+                submit_urls.append(url)
     
     if submit_urls:
-        # Pick the most complete URL
+        # Pick the most complete URL (prefer longer ones as they're more specific)
         submit_url = max(submit_urls, key=len)
         logger.info(f"✅ Found submit URL: {submit_url}")
         return submit_url
     
-    # If no absolute URL found, try to construct from base
-    if '/submit' in content.lower():
+    # Fallback: if we see "/submit" anywhere, construct from base
+    if '/submit' in content.lower() or 'submit' in content.lower():
         parsed = urlparse(base_url)
         submit_url = f"{parsed.scheme}://{parsed.netloc}/submit"
-        logger.info(f"⚠️ Constructed submit URL: {submit_url}")
+        logger.info(f"⚠️ Fallback constructed submit URL: {submit_url}")
         return submit_url
     
     logger.warning("❌ No submit URL found")
@@ -518,7 +531,20 @@ Return valid JSON with the actual answer (not empty/null):
 
 
 def submit_answer(submit_url, email, secret, quiz_url, answer):
-    """Submit answer"""
+    """Submit answer with URL validation"""
+    
+    # Validate submit_url is absolute
+    if not submit_url or not submit_url.startswith('http'):
+        logger.error(f"❌ Invalid submit URL: {submit_url}")
+        
+        # Try to fix it if it's relative
+        if submit_url and submit_url.startswith('/'):
+            parsed = urlparse(quiz_url)
+            submit_url = f"{parsed.scheme}://{parsed.netloc}{submit_url}"
+            logger.info(f"🔧 Fixed relative URL to: {submit_url}")
+        else:
+            return {"error": f"Invalid submit URL: {submit_url}"}
+    
     payload = {
         "email": email,
         "secret": secret,
