@@ -95,21 +95,34 @@ def extract_quiz_page(url):
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
         
-        # Additional wait for dynamic content
-        time.sleep(3)
+        # Wait longer for JavaScript to execute
+        time.sleep(5)  # Increased from 3 to 5 seconds
         
         # Try to wait for common result containers
-        for selector in ["#result", ".content", ".quiz-content"]:
+        for selector in ["#result", ".content", ".quiz-content", "#question", ".question"]:
             try:
                 WebDriverWait(driver, 3).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, selector))
                 )
+                logger.info(f"✅ Found element: {selector}")
                 break
             except:
                 pass
         
+        # Additional wait to ensure all JS has executed
+        time.sleep(2)
+        
         page_source = driver.page_source
         page_text = driver.find_element(By.TAG_NAME, "body").text
+        
+        # Also try to execute JavaScript to get any dynamically loaded content
+        try:
+            js_content = driver.execute_script("return document.body.innerText;")
+            if js_content and len(js_content) > len(page_text):
+                page_text = js_content
+                logger.info("✅ Used JavaScript to get inner text")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not execute JS: {e}")
         
         # Extract all links with better filtering
         links = []
@@ -121,6 +134,7 @@ def extract_quiz_page(url):
                     links.append(absolute_url)
         
         logger.info(f"✅ Extracted: {len(page_text)} chars, {len(links)} links")
+        logger.info(f"📝 Preview: {page_text[:200]}")
         
         return {
             "html": page_source,
@@ -287,6 +301,13 @@ def solve_quiz_with_llm(quiz_data, email, secret, quiz_url):
     if not client:
         return {"error": "LLM not initialized"}
     
+    # Extract the rendered page text (important for JS-rendered content)
+    page_text = quiz_data.get("text", "")
+    page_html = quiz_data.get("html", "")
+    
+    logger.info(f"📄 Page text length: {len(page_text)}")
+    logger.info(f"📄 First 500 chars: {page_text[:500]}")
+    
     # Download and parse all linked data
     downloaded_data = {}
     data_links = [l for l in quiz_data.get("links", [])[:10] 
@@ -336,38 +357,42 @@ def solve_quiz_with_llm(quiz_data, email, secret, quiz_url):
             logger.error(f"Error processing {link}: {e}")
     
     # Create comprehensive prompt
-    prompt = f"""You are a data analyst solving a quiz. Follow these steps:
+    prompt = f"""You are a data analyst solving a quiz. The quiz question is displayed on a webpage that may have been rendered by JavaScript.
 
-1. READ THE QUESTION CAREFULLY
-2. ANALYZE THE PROVIDED DATA
-3. CALCULATE THE EXACT ANSWER
-4. RETURN ONLY THE ANSWER IN THE CORRECT FORMAT
+RENDERED PAGE CONTENT (what the user sees in browser):
+{page_text[:5000]}
 
-QUESTION:
-{quiz_data.get('text', '')[:4000]}
+QUESTION/INSTRUCTIONS EXTRACTED:
+{page_text[:5000]}
 
-DATA FILES DOWNLOADED:
-{json.dumps(downloaded_data, indent=2, default=str)[:15000]}
+DOWNLOADED DATA FILES:
+{json.dumps(downloaded_data, indent=2, default=str)[:10000]}
 
-CRITICAL INSTRUCTIONS:
-- If question asks for a SUM, calculate the sum of the specified column
-- If question asks for a COUNT, count the items
-- If question asks for a specific VALUE, extract that exact value
-- If question asks for a STRING, return the string (not a number)
-- If question asks for a NUMBER, return a number (integer or float)
-- If question asks for a BOOLEAN, return true or false
-- Pay attention to which PAGE or SECTION the question refers to
+INSTRUCTIONS:
+1. READ the rendered page content carefully - it contains the actual question
+2. If the question asks you to extract something from the PAGE ITSELF (like a code, number, or text displayed on the page), find it in the "RENDERED PAGE CONTENT" above
+3. If the question asks you to download and analyze a file, use the "DOWNLOADED DATA FILES" section
+4. If the question asks you to scrape or extract information, look for it in the rendered content first
+5. Calculate or extract the exact answer requested
+6. Return the answer in the correct format (number, string, boolean, etc.)
+
+CRITICAL:
+- Empty strings "" are usually WRONG - find the actual answer
+- If you see text like "secret code is XXX" or "the answer is YYY", extract XXX or YYY
+- Numbers should be returned as integers or floats, not strings
+- Text/strings should be returned as strings
+- Look for patterns like: "The secret is:", "Answer:", "Code:", etc.
 
 Your response MUST be ONLY valid JSON (no markdown, no explanation):
 {{
-    "answer": <put_the_actual_answer_here>,
-    "reasoning": "brief 1-sentence explanation of how you got the answer"
+    "answer": <the_actual_answer_here>,
+    "reasoning": "brief explanation of where/how you found the answer"
 }}
 
 Examples:
-- If sum is 12345, return: {{"answer": 12345, "reasoning": "..."}}
-- If name is "John", return: {{"answer": "John", "reasoning": "..."}}
-- If yes/no, return: {{"answer": true, "reasoning": "..."}}"""
+- If page says "The secret code is ABC123", return: {{"answer": "ABC123", "reasoning": "Found in rendered page text"}}
+- If sum is 12345, return: {{"answer": 12345, "reasoning": "Calculated sum from table"}}
+- If yes/no, return: {{"answer": true, "reasoning": "..."}}"""""
 
     try:
         logger.info("🤖 Querying LLM...")
@@ -384,7 +409,7 @@ Examples:
                     "content": prompt
                 }
             ],
-            #temperature=0.1,
+            temperature=0.1,
         )
         
         response_text = response.choices[0].message.content.strip()
@@ -412,7 +437,50 @@ Examples:
                 "raw_response": response_text
             }
         
-        logger.info(f"✅ Extracted answer: {solution.get('answer')}")
+        answer = solution.get("answer")
+        
+        # Validate answer - don't allow empty strings for most cases
+        if answer == "" or answer is None:
+            logger.warning("⚠️ LLM returned empty answer, retrying with stricter prompt...")
+            
+            # Retry with more explicit instruction
+            retry_prompt = f"""CRITICAL: You returned an empty answer which is incorrect.
+
+Look at this content again and find the actual answer:
+
+{page_text[:3000]}
+
+The answer is DEFINITELY in the content above. Look for:
+- Text after "secret", "code", "answer", "result"
+- Numbers, values, or strings clearly displayed
+- Any emphasized or highlighted text
+
+Return valid JSON with the actual answer:
+{{
+    "answer": <actual_answer_not_empty>,
+    "reasoning": "where exactly I found it"
+}}"""
+
+            retry_response = client.chat.completions.create(
+                model=AIMLAPI_MODEL,
+                messages=[
+                    {"role": "system", "content": "Extract the answer from the content. Do not return empty strings."},
+                    {"role": "user", "content": retry_prompt}
+                ],
+                #temperature=0.1,
+            )
+            
+            retry_text = retry_response.choices[0].message.content.strip()
+            retry_text = re.sub(r'```json\s*|\s*```', '', retry_text)
+            
+            try:
+                solution = json.loads(retry_text)
+                answer = solution.get("answer")
+                logger.info(f"✅ Retry answer: {answer}")
+            except:
+                logger.error("❌ Retry also failed")
+        
+        logger.info(f"✅ Final answer: {solution.get('answer')}")
         return solution
         
     except Exception as e:
