@@ -352,40 +352,48 @@ def extract_submit_url(content, base_url):
     
     # Find ALL URLs in content (absolute and relative)
     url_patterns = [
-        r'(https?://[^\s<>"\']+)',  # Absolute URLs
-        r'href=["\']([^"\']+)["\']',  # href attributes
-        r'to\s+(https?://[^\s<>"]+)',  # "to https://..."
-        r'POST[^\n]*to[^\n]*(https?://[^\s<>"]+)',  # POST ... to URL
-        r'(?:POST|post)[^\n]*?([/\w-]+/submit[^\s<>"\']*)',  # Relative submit paths
+        # Absolute URLs
+        r'(https?://[^\s<>"\']+/submit[^\s<>"\']*)',  # Full submit URLs
+        r'POST[^\n]*?(https?://[^\s<>"\']+)',  # URLs after POST
+        # Relative URLs - more precise patterns
+        r'(?:POST|post|Submit|submit)[^\n]*?(\s+/submit[^\s<>"\']*)',  # "POST to /submit"
+        r'href=["\']([^"\']*submit[^"\']*)["\']',  # href="/submit"
+        r'to\s+([/\w-]*submit[^\s<>"\']*)',  # "to /submit"
     ]
     
     found_urls = []
     for pattern in url_patterns:
         matches = re.findall(pattern, content, flags=re.IGNORECASE)
-        found_urls.extend(matches)
+        # Clean up matches (remove leading/trailing whitespace)
+        clean_matches = [m.strip() for m in matches if m and m.strip()]
+        found_urls.extend(clean_matches)
+    
+    logger.info(f"🔍 Found URL candidates: {found_urls}")
     
     # Filter for submit URLs and convert relative to absolute
     submit_urls = []
     for url in found_urls:
         if 'submit' in url.lower():
-            # If it's a relative URL (starts with / or doesn't have http)
-            if url.startswith('/') or not url.startswith('http'):
+            # If it's a relative URL (starts with /)
+            if url.startswith('/'):
                 # Convert to absolute URL using base_url
                 parsed_base = urlparse(base_url)
-                absolute_url = f"{parsed_base.scheme}://{parsed_base.netloc}{url if url.startswith('/') else '/' + url}"
+                absolute_url = f"{parsed_base.scheme}://{parsed_base.netloc}{url}"
                 submit_urls.append(absolute_url)
                 logger.info(f"🔗 Converted relative URL: {url} → {absolute_url}")
-            else:
+            elif url.startswith('http'):
+                # Already absolute
                 submit_urls.append(url)
+                logger.info(f"🔗 Found absolute URL: {url}")
     
     if submit_urls:
         # Pick the most complete URL (prefer longer ones as they're more specific)
         submit_url = max(submit_urls, key=len)
-        logger.info(f"✅ Found submit URL: {submit_url}")
+        logger.info(f"✅ Selected submit URL: {submit_url}")
         return submit_url
     
-    # Fallback: if we see "/submit" anywhere, construct from base
-    if '/submit' in content.lower() or 'submit' in content.lower():
+    # Fallback: if we see "submit" in content, construct from base
+    if 'submit' in content.lower():
         parsed = urlparse(base_url)
         submit_url = f"{parsed.scheme}://{parsed.netloc}/submit"
         logger.info(f"⚠️ Fallback constructed submit URL: {submit_url}")
