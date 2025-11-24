@@ -270,7 +270,7 @@ def parse_pdf(pdf_bytes):
 
 
 def parse_csv(csv_content):
-    """Parse CSV - handle ANY structure dynamically"""
+    """Parse CSV - handle ANY structure with comprehensive analysis for ALL question types"""
     try:
         if isinstance(csv_content, bytes):
             csv_content = csv_content.decode("utf-8")
@@ -280,31 +280,38 @@ def parse_csv(csv_content):
         # Clean column names
         df.columns = [str(col).strip() for col in df.columns]
         
-        # Analyze ALL columns dynamically
+        # Comprehensive analysis for ALL columns - supports ANY question type
         column_analysis = {}
         for col in df.columns:
             col_data = df[col]
             analysis = {
                 "dtype": str(col_data.dtype),
-                "non_null_count": col_data.notna().sum(),
-                "null_count": col_data.isna().sum()
+                "non_null_count": int(col_data.notna().sum()),
+                "null_count": int(col_data.isna().sum())
             }
             
-            # If numeric, provide stats
+            # If numeric, provide FULL statistical analysis
             if pd.api.types.is_numeric_dtype(col_data):
                 analysis.update({
                     "sum": float(col_data.sum()),
                     "mean": float(col_data.mean()),
+                    "median": float(col_data.median()),
                     "min": float(col_data.min()),
                     "max": float(col_data.max()),
-                    "std": float(col_data.std()) if len(col_data) > 1 else 0
+                    "std": float(col_data.std()) if len(col_data) > 1 else 0,
+                    "variance": float(col_data.var()) if len(col_data) > 1 else 0,
+                    "q25": float(col_data.quantile(0.25)),
+                    "q75": float(col_data.quantile(0.75)),
+                    "count_above_mean": int((col_data > col_data.mean()).sum()),
+                    "count_below_mean": int((col_data < col_data.mean()).sum())
                 })
-                logger.info(f"  '{col}': sum={analysis['sum']}, mean={analysis['mean']:.2f}")
+                logger.info(f"  '{col}': sum={analysis['sum']}, mean={analysis['mean']:.2f}, median={analysis['median']}, std={analysis['std']:.2f}")
             else:
-                # For non-numeric, provide unique values
+                # For non-numeric, provide unique values and counts
                 unique_vals = col_data.unique()
                 analysis["unique_count"] = len(unique_vals)
-                analysis["sample_values"] = unique_vals[:5].tolist()
+                analysis["sample_values"] = unique_vals[:10].tolist()
+                analysis["value_counts"] = col_data.value_counts().head(10).to_dict()
             
             column_analysis[col] = analysis
         
@@ -314,7 +321,9 @@ def parse_csv(csv_content):
             "columns": list(df.columns),
             "column_analysis": column_analysis,
             "first_10_rows": df.head(10).to_dict('records'),
-            "last_10_rows": df.tail(10).to_dict('records')
+            "last_10_rows": df.tail(10).to_dict('records'),
+            # Include sample data for ML/filtering tasks
+            "data_sample": df.to_dict('records')[:100]
         }
         
         logger.info(f"✅ CSV: {df.shape[0]} rows × {df.shape[1]} columns")
@@ -711,16 +720,22 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "service": "Dynamic Quiz Solver",
-        "version": "3.0",
+        "service": "Universal Quiz Solver",
+        "version": "4.0",
         "status": "running",
         "model": AIMLAPI_MODEL,
-        "features": [
-            "Zero hardcoding",
-            "Dynamic file parsing",
-            "Adaptive LLM prompting",
-            "Smart scraping detection"
-        ]
+        "capabilities": [
+            "Web scraping (JavaScript support)",
+            "Statistical analysis (mean, median, std, quartiles)",
+            "ML predictions & classifications",
+            "Data filtering & aggregation",
+            "Complex calculations (z-scores, probabilities)",
+            "Visualization descriptions",
+            "File parsing (PDF, CSV, Excel, JSON)",
+            "API integration",
+            "Data cleaning & transformation"
+        ],
+        "max_time_per_quiz_chain": "170 seconds"
     }), 200
 
 
