@@ -589,21 +589,33 @@ def submit_answer(submit_url, email, secret, quiz_url, answer):
         return {"error": str(e)}
 
 
-def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
-    """Process quiz chain - FULLY DYNAMIC"""
+def process_quiz_chain(initial_url, email, secret, start_time, max_chain_time=3600):
+    """
+    Process indefinite quiz chain - Runs until no more URLs
+    Each individual quiz has 3 minutes (180s) from when it starts
+    Chain continues indefinitely until server stops providing URLs
+    """
     current_url = initial_url
     results = []
     iteration = 0
+    chain_start = start_time
     
-    while current_url and (time.time() - start_time) < timeout:
+    # INDEFINITE LOOP - continues until server stops providing URLs
+    while current_url:
         iteration += 1
-        elapsed = time.time() - start_time
-        remaining = timeout - elapsed
+        quiz_start_time = time.time()  # Track start time for THIS quiz
+        chain_elapsed = time.time() - chain_start
+        
+        # Safety check: if chain exceeds 1 hour, stop (prevents infinite loops)
+        if chain_elapsed > max_chain_time:
+            logger.warning(f"⚠️ Chain exceeded {max_chain_time}s, stopping for safety")
+            break
         
         logger.info(f"\n{'='*70}")
         logger.info(f"🎯 QUIZ #{iteration}")
         logger.info(f"📍 URL: {current_url}")
-        logger.info(f"⏱️  Time: {elapsed:.1f}s elapsed, {remaining:.1f}s remaining")
+        logger.info(f"⏱️  Chain time: {chain_elapsed:.1f}s total")
+        logger.info(f"⏱️  This quiz: Starting now (max 180s for this quiz)")
         logger.info(f"{'='*70}")
         
         try:
@@ -614,7 +626,8 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                     "quiz_number": iteration,
                     "url": current_url,
                     "error": quiz_page["error"],
-                    "status": "extraction_failed"
+                    "status": "extraction_failed",
+                    "time_taken": time.time() - quiz_start_time
                 })
                 break
             
@@ -627,7 +640,8 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                     "quiz_number": iteration,
                     "url": current_url,
                     "error": "Could not find submit URL",
-                    "status": "no_submit_url"
+                    "status": "no_submit_url",
+                    "time_taken": time.time() - quiz_start_time
                 })
                 break
             
@@ -637,6 +651,12 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                 # Skip submit URLs
                 if 'submit' in link.lower() and 'data' not in link.lower():
                     continue
+                
+                # Check if we're approaching quiz time limit (180s per quiz)
+                quiz_elapsed = time.time() - quiz_start_time
+                if quiz_elapsed > 150:  # Leave 30s margin
+                    logger.warning(f"⚠️ Approaching quiz time limit ({quiz_elapsed:.1f}s), stopping downloads")
+                    break
                 
                 # Decide: scrape or download?
                 parsed_link = urlparse(link)
@@ -666,7 +686,8 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                     "quiz_number": iteration,
                     "url": current_url,
                     "error": solution.get("error"),
-                    "status": "solving_failed"
+                    "status": "solving_failed",
+                    "time_taken": time.time() - quiz_start_time
                 })
                 break
             
@@ -676,14 +697,21 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                     "quiz_number": iteration,
                     "url": current_url,
                     "error": "No answer from LLM",
-                    "status": "no_answer"
+                    "status": "no_answer",
+                    "time_taken": time.time() - quiz_start_time
                 })
                 break
+            
+            # Check quiz time before submitting
+            quiz_elapsed = time.time() - quiz_start_time
+            if quiz_elapsed > 170:  # Close to 3 min limit
+                logger.warning(f"⚠️ Quiz took {quiz_elapsed:.1f}s (close to 180s limit)")
             
             # Submit
             submission = submit_answer(submit_url, email, secret, current_url, answer)
             
             is_correct = submission.get("correct", False)
+            quiz_time = time.time() - quiz_start_time
             
             results.append({
                 "quiz_number": iteration,
@@ -691,28 +719,37 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                 "solution": solution,
                 "submission_result": submission,
                 "status": "correct" if is_correct else "incorrect",
-                "correct": is_correct
+                "correct": is_correct,
+                "time_taken": round(quiz_time, 2)
             })
             
-            # Next quiz?
+            logger.info(f"⏱️  Quiz #{iteration} completed in {quiz_time:.2f}s")
+            
+            # CRITICAL: Check for next URL (INDEFINITE LOOP continues)
             next_url = submission.get("url")
             if next_url:
                 current_url = next_url
-                logger.info(f"➡️  Next: {current_url}")
+                logger.info(f"➡️  Next quiz: {current_url}")
+                # Loop continues with new URL
             else:
-                logger.info("🏁 Complete!")
+                # No more URLs - evaluation complete
+                logger.info("🏁 No more URLs - Evaluation complete!")
                 break
                 
         except Exception as e:
-            logger.error(f"❌ Exception: {e}")
+            logger.error(f"❌ Exception in quiz #{iteration}: {e}")
             logger.error(traceback.format_exc())
             results.append({
                 "quiz_number": iteration,
                 "url": current_url,
                 "error": str(e),
-                "status": "exception"
+                "status": "exception",
+                "time_taken": time.time() - quiz_start_time
             })
             break
+    
+    total_chain_time = time.time() - chain_start
+    logger.info(f"📊 Chain statistics: {len(results)} quizzes in {total_chain_time:.2f}s")
     
     return results
 
