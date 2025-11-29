@@ -45,7 +45,7 @@ EMAIL = os.getenv("STUDENT_EMAIL")
 SECRET = os.getenv("STUDENT_SECRET")
 AIMLAPI_BASE_URL = os.getenv("AIMLAPI_BASE_URL", "https://aipipe.org/openai/v1")
 AIMLAPI_API_KEY = os.getenv("AIMLAPI_API_KEY")
-AIMLAPI_MODEL = os.getenv("gpt-4o-mini")
+AIMLAPI_MODEL = os.getenv("AIMLAPI_MODEL", "gpt-5-mini")
 
 CHROME_BINARY = os.getenv("CHROME_BIN", "/usr/bin/chromium")
 CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
