@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Fully Dynamic Quiz Solver - ENHANCED VERSION
-Handles any quiz type with improved data access and reasoning
+Fully Dynamic Quiz Solver - NO HARDCODING
+Handles any quiz type dynamically
 """
 
 import os
@@ -85,7 +85,10 @@ def setup_browser():
 
 
 def extract_page_content(url, max_wait=7):
-    """Extract content from any webpage - FULLY DYNAMIC"""
+    """
+    Extract content from any webpage - FULLY DYNAMIC
+    No assumptions about page structure
+    """
     logger.info(f"🌐 Extracting: {url}")
     driver = setup_browser()
     
@@ -103,17 +106,21 @@ def extract_page_content(url, max_wait=7):
             time.sleep(1)
             current_text = driver.find_element(By.TAG_NAME, "body").text
             
+            # If content hasn't changed for 2 seconds, assume it's loaded
             if i > 2 and current_text == previous_text and len(current_text) > 50:
                 logger.info(f"✅ Content stabilized after {i}s")
                 break
             
             previous_text = current_text
         
+        # Final wait to be safe
         time.sleep(1)
         
+        # Get all content
         page_source = driver.page_source
         page_text = driver.find_element(By.TAG_NAME, "body").text
         
+        # Try JavaScript extraction as fallback
         try:
             js_text = driver.execute_script("return document.body.innerText;")
             if js_text and len(js_text) > len(page_text):
@@ -121,6 +128,7 @@ def extract_page_content(url, max_wait=7):
         except:
             pass
         
+        # Extract ALL links (don't filter)
         links = []
         for link in driver.find_elements(By.TAG_NAME, "a"):
             href = link.get_attribute("href")
@@ -168,10 +176,14 @@ def download_file(url, timeout=30):
 
 
 def smart_parse_file(file_content, url):
-    """Intelligently parse any file type"""
+    """
+    Intelligently parse any file type - FULLY DYNAMIC
+    No assumptions about content structure
+    """
     result = {"type": "unknown", "content": None, "error": None}
     
     try:
+        # Detect file type
         if file_content[:4] == b"%PDF":
             result["type"] = "pdf"
             result["content"] = parse_pdf(file_content)
@@ -192,6 +204,7 @@ def smart_parse_file(file_content, url):
                 result["error"] = "Invalid JSON"
         
         else:
+            # Try as text
             result["type"] = "text"
             try:
                 result["content"] = file_content.decode('utf-8')
@@ -208,7 +221,7 @@ def smart_parse_file(file_content, url):
 
 
 def parse_pdf(pdf_bytes):
-    """Parse PDF - extract ALL text and tables"""
+    """Parse PDF - extract ALL text and tables dynamically"""
     try:
         result = {
             "pages": [],
@@ -220,11 +233,13 @@ def parse_pdf(pdf_bytes):
             for page_num, page in enumerate(pdf.pages, 1):
                 page_data = {"page_number": page_num}
                 
+                # Extract text
                 text = page.extract_text()
                 if text:
                     page_data["text"] = text
                     result["all_text"] += f"\n--- Page {page_num} ---\n{text}"
                 
+                # Extract tables
                 tables = page.extract_tables()
                 if tables:
                     page_data["tables"] = []
@@ -255,15 +270,17 @@ def parse_pdf(pdf_bytes):
 
 
 def parse_csv(csv_content):
-    """Parse CSV - COMPLETE analysis with ALL data for accurate calculations"""
+    """Parse CSV - handle ANY structure with comprehensive analysis for ALL question types"""
     try:
         if isinstance(csv_content, bytes):
             csv_content = csv_content.decode("utf-8")
         
         df = pd.read_csv(io.StringIO(csv_content))
+        
+        # Clean column names
         df.columns = [str(col).strip() for col in df.columns]
         
-        # Comprehensive column analysis
+        # Comprehensive analysis for ALL columns - supports ANY question type
         column_analysis = {}
         for col in df.columns:
             col_data = df[col]
@@ -273,6 +290,7 @@ def parse_csv(csv_content):
                 "null_count": int(col_data.isna().sum())
             }
             
+            # If numeric, provide FULL statistical analysis
             if pd.api.types.is_numeric_dtype(col_data):
                 analysis.update({
                     "sum": float(col_data.sum()),
@@ -289,6 +307,7 @@ def parse_csv(csv_content):
                 })
                 logger.info(f"  '{col}': sum={analysis['sum']}, mean={analysis['mean']:.2f}, median={analysis['median']}, std={analysis['std']:.2f}")
             else:
+                # For non-numeric, provide unique values and counts
                 unique_vals = col_data.unique()
                 analysis["unique_count"] = len(unique_vals)
                 analysis["sample_values"] = unique_vals[:10].tolist()
@@ -296,7 +315,6 @@ def parse_csv(csv_content):
             
             column_analysis[col] = analysis
         
-        # CRITICAL: Include ALL data for precise calculations
         result = {
             "shape": df.shape,
             "row_count": len(df),
@@ -304,8 +322,8 @@ def parse_csv(csv_content):
             "column_analysis": column_analysis,
             "first_10_rows": df.head(10).to_dict('records'),
             "last_10_rows": df.tail(10).to_dict('records'),
-            # Include ALL data (up to 10000 rows for filtering/calculations)
-            "all_data": df.head(10000).to_dict('records')
+            # Include sample data for ML/filtering tasks
+            "data_sample": df.to_dict('records')[:100]
         }
         
         logger.info(f"✅ CSV: {df.shape[0]} rows × {df.shape[1]} columns")
@@ -322,6 +340,7 @@ def parse_excel(excel_bytes):
         
         result = {"sheets": {}}
         for sheet_name, df in dfs.items():
+            # Use same analysis as CSV
             csv_str = df.to_csv(index=False)
             result["sheets"][sheet_name] = parse_csv(csv_str.encode())
         
@@ -333,43 +352,56 @@ def parse_excel(excel_bytes):
 
 
 def extract_submit_url(content, base_url):
-    """Dynamically extract submit URL"""
+    """
+    Dynamically extract submit URL - NO HARDCODING
+    Looks for any URL containing 'submit' and converts relative URLs to absolute
+    """
     if not content:
         return None
     
+    # Find ALL URLs in content (absolute and relative)
     url_patterns = [
-        r'(https?://[^\s<>"\']+/submit[^\s<>"\']*)',
-        r'POST[^\n]*?(https?://[^\s<>"\']+)',
-        r'(?:POST|post|Submit|submit)[^\n]*?(\s+/submit[^\s<>"\']*)',
-        r'href=["\']([^"\']*submit[^"\']*)["\']',
-        r'to\s+([/\w-]*submit[^\s<>"\']*)',
+        # Absolute URLs
+        r'(https?://[^\s<>"\']+/submit[^\s<>"\']*)',  # Full submit URLs
+        r'POST[^\n]*?(https?://[^\s<>"\']+)',  # URLs after POST
+        # Relative URLs - more precise patterns
+        r'(?:POST|post|Submit|submit)[^\n]*?(\s+/submit[^\s<>"\']*)',  # "POST to /submit"
+        r'href=["\']([^"\']*submit[^"\']*)["\']',  # href="/submit"
+        r'to\s+([/\w-]*submit[^\s<>"\']*)',  # "to /submit"
     ]
     
     found_urls = []
     for pattern in url_patterns:
         matches = re.findall(pattern, content, flags=re.IGNORECASE)
+        # Clean up matches (remove leading/trailing whitespace)
         clean_matches = [m.strip() for m in matches if m and m.strip()]
         found_urls.extend(clean_matches)
     
     logger.info(f"🔍 Found URL candidates: {found_urls}")
     
+    # Filter for submit URLs and convert relative to absolute
     submit_urls = []
     for url in found_urls:
         if 'submit' in url.lower():
+            # If it's a relative URL (starts with /)
             if url.startswith('/'):
+                # Convert to absolute URL using base_url
                 parsed_base = urlparse(base_url)
                 absolute_url = f"{parsed_base.scheme}://{parsed_base.netloc}{url}"
                 submit_urls.append(absolute_url)
                 logger.info(f"🔗 Converted relative URL: {url} → {absolute_url}")
             elif url.startswith('http'):
+                # Already absolute
                 submit_urls.append(url)
                 logger.info(f"🔗 Found absolute URL: {url}")
     
     if submit_urls:
+        # Pick the most complete URL (prefer longer ones as they're more specific)
         submit_url = max(submit_urls, key=len)
         logger.info(f"✅ Selected submit URL: {submit_url}")
         return submit_url
     
+    # Fallback: if we see "submit" in content, construct from base
     if 'submit' in content.lower():
         parsed = urlparse(base_url)
         submit_url = f"{parsed.scheme}://{parsed.netloc}/submit"
@@ -382,7 +414,8 @@ def extract_submit_url(content, base_url):
 
 def solve_with_llm(quiz_page, downloaded_files, quiz_url):
     """
-    Solve quiz with LLM - ENHANCED with better prompting and data access
+    Solve quiz with LLM - FULLY DYNAMIC
+    No assumptions about question type or answer format
     """
     if not client:
         return {"error": "LLM not initialized"}
@@ -392,59 +425,46 @@ def solve_with_llm(quiz_page, downloaded_files, quiz_url):
     logger.info(f"📄 Analyzing: {len(page_text)} chars of question")
     logger.info(f"📄 With {len(downloaded_files)} data files")
     
-    # Enhanced prompt with explicit operation guidance
-    prompt = f"""You are solving a data analysis quiz. Read the question VERY CAREFULLY and perform the EXACT operation requested.
+    # Build comprehensive context
+    context = {
+        "question_page": {
+            "text": page_text[:5000],
+            "url": quiz_url
+        },
+        "data_files": downloaded_files
+    }
+    
+    # Create adaptive prompt - NO ASSUMPTIONS
+    prompt = f"""You are solving a data analysis quiz. Analyze the question and data to determine the correct answer.
 
 QUESTION PAGE:
 {page_text[:4000]}
 
 AVAILABLE DATA:
-{json.dumps(downloaded_files, indent=2, default=str)[:20000]}
+{json.dumps(downloaded_files, indent=2, default=str)[:15000]}
 
-CRITICAL INSTRUCTIONS - READ CAREFULLY:
+INSTRUCTIONS:
+1. Carefully read what the question is asking for
+2. Identify what data or information is needed
+3. Use the provided data to calculate/extract the answer
+4. Return the answer in the format requested by the question
 
-1. UNDERSTAND THE OPERATION REQUESTED:
-   - "Count how many..." → COUNT operation (number of items matching condition)
-   - "Sum of..." → SUM operation (add up all values)
-   - "What is the sum of numbers greater than X" → Filter THEN sum
-   - "Average/Mean of..." → MEAN calculation
-   - "Find the..." → EXTRACT specific value
+RULES:
+- The answer MUST come from analyzing the actual data provided
+- DO NOT use example values or placeholders from the question itself
+- If question asks for a calculation (sum, count, average), perform it on the actual data
+- If question asks to scrape/extract something, look in the scraped data
+- Match the answer type to what's requested (number, string, boolean, object)
+- Be precise and exact
 
-2. FOR FILTERING + AGGREGATION QUESTIONS:
-   Example: "What is the sum of numbers greater than 59873?"
-   Step 1: Filter data where value > 59873
-   Step 2: Sum those filtered values
-   
-   The data includes "all_data" with ALL rows - use this to filter and calculate!
-
-3. DO NOT ESTIMATE OR INTERPOLATE:
-   - You have the actual data in "all_data"
-   - Filter it, then perform the exact calculation
-   - Do NOT use percentile estimation or approximation
-
-4. ANSWER FORMAT:
-   - If question asks for a number, return just the number
-   - If question asks for text, return the text
-   - Match the format requested
-
-5. USE THE DATA PROVIDED:
-   - "all_data" contains all rows for filtering
-   - "column_analysis" has pre-calculated stats (sum, mean, etc.)
-   - For filtering questions, iterate through "all_data"
-
-EXAMPLE CALCULATION PATTERNS:
-- "Sum of values > X": sum([row[col] for row in all_data if row[col] > X])
-- "Count values > X": len([row for row in all_data if row[col] > X])
-- "Sum of column Y": column_analysis[Y]["sum"]
-
-Return ONLY valid JSON (no markdown, no code blocks):
+Return ONLY valid JSON (no markdown):
 {{
-    "answer": <calculated_answer>,
-    "reasoning": "Step-by-step: what operation I performed and why",
+    "answer": <calculated_or_extracted_answer>,
+    "reasoning": "how you determined this answer",
     "confidence": "high/medium/low"
 }}
 
-CRITICAL: Perform the EXACT calculation requested. Do not estimate, interpolate, or approximate when you have the actual data!"""
+CRITICAL: Your answer MUST be based on the actual data, not examples in the question."""
 
     try:
         logger.info("🤖 Querying LLM...")
@@ -452,17 +472,14 @@ CRITICAL: Perform the EXACT calculation requested. Do not estimate, interpolate,
         response = client.chat.completions.create(
             model=AIMLAPI_MODEL,
             messages=[
-                {
-                    "role": "system", 
-                    "content": "You are a precise data analyst. Read questions word-by-word. Perform EXACT calculations using the provided data. COUNT ≠ SUM. Filter first, then aggregate."
-                },
+                {"role": "system", "content": "You are a data analyst. Analyze data carefully and return valid JSON only."},
                 {"role": "user", "content": prompt}
             ],
             #temperature=0.1,
         )
         
         response_text = response.choices[0].message.content.strip()
-        logger.info(f"🤖 LLM response: {response_text[:500]}")
+        logger.info(f"🤖 LLM response: {response_text[:300]}")
         
         # Parse JSON
         response_text = re.sub(r'```json\s*|\s*```', '', response_text)
@@ -481,42 +498,34 @@ CRITICAL: Perform the EXACT calculation requested. Do not estimate, interpolate,
         
         answer = solution["answer"]
         
-        # Validate answer
+        # Validate answer is not empty/null
         if answer == "" or answer is None or answer == "N/A":
             logger.warning("⚠️ LLM returned empty/null answer, attempting retry...")
             
-            retry_prompt = f"""RETRY - Previous answer was invalid.
+            # Retry with more explicit prompt
+            retry_prompt = f"""The previous attempt returned an invalid answer.
 
-QUESTION (READ WORD BY WORD):
+QUESTION:
 {page_text[:2000]}
 
-DATA AVAILABLE:
-{json.dumps(downloaded_files, indent=2, default=str)[:15000]}
+DATA:
+{json.dumps(downloaded_files, indent=2, default=str)[:10000]}
 
-The question asks you to perform a specific calculation. You have ALL the data needed.
+The answer MUST be extractable from the data above. Look carefully for:
+- Numbers to calculate (sum, count, average, etc.)
+- Text to extract (codes, secrets, names, etc.)
+- Values to identify
 
-If the question mentions "sum of numbers greater than X":
-1. Look in all_data for ALL rows
-2. Filter rows where value > X
-3. Sum those filtered values
-
-If the question asks "count how many":
-1. Filter the data based on condition
-2. Return the count
-
-Return JSON with the EXACT calculated answer:
-{{"answer": <actual_number_from_calculation>, "reasoning": "I filtered X rows where value > Y, then summed them to get Z"}}"""
+Return valid JSON with the actual answer (not empty/null):
+{{"answer": <actual_value>, "reasoning": "where I found it"}}"""
 
             retry_response = client.chat.completions.create(
                 model=AIMLAPI_MODEL,
                 messages=[
-                    {
-                        "role": "system", 
-                        "content": "You have the complete dataset. Filter it, then calculate. Return the exact answer."
-                    },
+                    {"role": "system", "content": "Return the actual answer from the data, not placeholders."},
                     {"role": "user", "content": retry_prompt}
                 ],
-                #temperature=0.1,
+                #temperature=0.2,
             )
             
             retry_text = retry_response.choices[0].message.content.strip()
@@ -541,9 +550,11 @@ Return JSON with the EXACT calculated answer:
 def submit_answer(submit_url, email, secret, quiz_url, answer):
     """Submit answer with URL validation"""
     
+    # Validate submit_url is absolute
     if not submit_url or not submit_url.startswith('http'):
         logger.error(f"❌ Invalid submit URL: {submit_url}")
         
+        # Try to fix it if it's relative
         if submit_url and submit_url.startswith('/'):
             parsed = urlparse(quiz_url)
             submit_url = f"{parsed.scheme}://{parsed.netloc}{submit_url}"
@@ -596,6 +607,7 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
         logger.info(f"{'='*70}")
         
         try:
+            # Extract quiz page
             quiz_page = extract_page_content(current_url)
             if quiz_page.get("error"):
                 results.append({
@@ -606,6 +618,7 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                 })
                 break
             
+            # Find submit URL dynamically
             combined_content = quiz_page.get("html", "") + "\n" + quiz_page.get("text", "")
             submit_url = extract_submit_url(combined_content, current_url)
             
@@ -618,20 +631,25 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                 })
                 break
             
+            # Process ALL linked files/pages dynamically
             downloaded_files = {}
             for link in quiz_page.get("links", []):
+                # Skip submit URLs
                 if 'submit' in link.lower() and 'data' not in link.lower():
                     continue
                 
+                # Decide: scrape or download?
                 parsed_link = urlparse(link)
                 file_ext = parsed_link.path.split('.')[-1].lower() if '.' in parsed_link.path else ''
                 
+                # If has common file extension, download
                 if file_ext in ['pdf', 'csv', 'json', 'xlsx', 'xls', 'txt']:
                     file_content = download_file(link)
                     if file_content:
                         parsed = smart_parse_file(file_content, link)
                         downloaded_files[link] = parsed
                 else:
+                    # Otherwise scrape (might be another page with data)
                     logger.info(f"🌐 Scraping linked page: {link}")
                     scraped = extract_page_content(link)
                     if not scraped.get("error"):
@@ -640,6 +658,7 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                             "content": scraped.get("text", "")
                         }
             
+            # Solve with LLM
             solution = solve_with_llm(quiz_page, downloaded_files, current_url)
             
             if "error" in solution:
@@ -661,6 +680,7 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                 })
                 break
             
+            # Submit
             submission = submit_answer(submit_url, email, secret, current_url, answer)
             
             is_correct = submission.get("correct", False)
@@ -674,6 +694,7 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
                 "correct": is_correct
             })
             
+            # Next quiz?
             next_url = submission.get("url")
             if next_url:
                 current_url = next_url
@@ -699,18 +720,20 @@ def process_quiz_chain(initial_url, email, secret, start_time, timeout=170):
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "service": "Universal Quiz Solver - Enhanced",
-        "version": "5.0",
+        "service": "Universal Quiz Solver",
+        "version": "4.0",
         "status": "running",
         "model": AIMLAPI_MODEL,
         "capabilities": [
             "Web scraping (JavaScript support)",
             "Statistical analysis (mean, median, std, quartiles)",
-            "Filtering + Aggregation (sum/count with conditions)",
             "ML predictions & classifications",
-            "Data cleaning & transformation",
+            "Data filtering & aggregation",
+            "Complex calculations (z-scores, probabilities)",
+            "Visualization descriptions",
             "File parsing (PDF, CSV, Excel, JSON)",
-            "Complex calculations with full data access"
+            "API integration",
+            "Data cleaning & transformation"
         ],
         "max_time_per_quiz_chain": "170 seconds"
     }), 200
@@ -783,5 +806,5 @@ def quiz_endpoint():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 7860))
-    logger.info(f"🚀 Enhanced Quiz Solver starting on port {port}")
+    logger.info(f"🚀 Dynamic Quiz Solver starting on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
