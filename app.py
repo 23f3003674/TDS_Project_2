@@ -11,6 +11,7 @@ import requests
 import re
 import io
 import traceback
+import base64
 from urllib.parse import urljoin, urlparse
 from typing import Dict, List, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -126,7 +127,7 @@ def extract_page_content(url: str, max_wait: int = 10) -> Dict[str, Any]:
         stable_count = 0
         
         # Keywords that indicate quiz content has loaded
-        critical_keywords = ["result", "quiz", "question", "data", "download", "submit", "answer"]
+        critical_keywords = ["result", "quiz", "question", "data", "download", "submit", "answer", "command", "file"]
         
         for i in range(max_wait):
             time.sleep(1)
@@ -278,6 +279,24 @@ def smart_parse_file(file_content: bytes, url: str) -> Dict[str, Any]:
                 result["content"] = file_content.decode('utf-8')
             except:
                 result["content"] = file_content.decode('utf-8', errors='ignore')
+        
+        elif url.lower().endswith(('.opus', '.mp3', '.wav', '.ogg', '.m4a', '.flac')):
+            result["type"] = "audio"
+            result["content"] = {
+                "base64": base64.b64encode(file_content).decode('utf-8'),
+                "size": len(file_content),
+                "format": url.split('.')[-1].lower(),
+                "note": "Audio file - needs transcription service"
+            }
+            logger.info(f"✅ Audio file detected: {url.split('.')[-1].upper()}, {len(file_content)} bytes")
+        
+        elif url.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')):
+            result["type"] = "image"
+            result["content"] = {
+                "base64": base64.b64encode(file_content).decode('utf-8'),
+                "size": len(file_content),
+                "format": url.split('.')[-1].lower()
+            }
         
         else:
             # Try as text
@@ -588,7 +607,7 @@ def extract_submit_url(content: str, base_url: str) -> Optional[str]:
         return matches[0]
     
     # Strategy 5: Fallback - construct from base URL ONLY if we see JSON payload structure
-    if 'submit' in content.lower() and '"url"' in content and '"answer"' in content:
+    if 'submit' in content.lower() and ('"url"' in content or '"answer"' in content or 'POST' in content):
         fallback_url = f"{base_domain}/submit"
         logger.info(f"⚠️ Using fallback submit URL: {fallback_url}")
         return fallback_url
@@ -600,7 +619,7 @@ def extract_submit_url(content: str, base_url: str) -> Optional[str]:
 # LLM SOLVING
 # ============================================================================
 
-def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], quiz_url: str) -> Dict[str, Any]:
+def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], quiz_url: str, user_email: str) -> Dict[str, Any]:
     """
     Solve quiz with LLM using advanced prompting
     """
@@ -615,7 +634,7 @@ def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], 
     # Build comprehensive context with smart truncation per file
     context_parts = {}
     total_size = 0
-    max_total_size = 30000  # Increased limit
+    max_total_size = 40000  # Increased limit
     
     for url, file_data in downloaded_files.items():
         file_str = json.dumps(file_data, indent=2, default=str)
@@ -641,6 +660,11 @@ def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], 
                 summary["page_count"] = content.get("page_count", 0)
                 summary["all_text"] = content.get("all_text", "")[:3000]
                 summary["all_tables"] = content.get("all_tables", [])
+            elif file_data.get("type") == "audio":
+                # Include audio metadata but note transcription needed
+                summary["audio_format"] = file_data.get("content", {}).get("format")
+                summary["audio_size"] = file_data.get("content", {}).get("size")
+                summary["note"] = "Audio file detected - transcription service required"
             else:
                 summary["content_preview"] = str(file_data.get("content", ""))[:3000]
             
@@ -658,51 +682,66 @@ def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], 
     context_str = json.dumps(context_parts, indent=2, default=str)
     logger.info(f"📊 Context size: {len(context_str)} chars")
     
-    # Create the prompt
-    prompt = f"""You are a precise data analyst solving a quiz. Your job is to read the question carefully, analyze the provided data, and return the EXACT answer requested.
+    # Create the prompt with enhanced instructions
+    prompt = f"""You are a precise data analyst and command-line expert solving a quiz. Your job is to read the question carefully, analyze the provided data, and return the EXACT answer requested.
+
+USER EMAIL: {user_email}
 
 QUESTION:
-{page_text[:6000]}
+{page_text[:8000]}
 
 AVAILABLE DATA:
 {context_str}
 
 CRITICAL INSTRUCTIONS:
-1. READ the question carefully - what EXACTLY is it asking for?
-2. IDENTIFY which data source contains the answer
-3. PERFORM the required calculation/extraction on the ACTUAL data (not example values)
-4. RETURN the answer in the exact format requested
+1. READ the question VERY carefully - what EXACTLY is it asking for?
+2. If the question asks for a COMMAND or CODE, return the EXACT command/code string
+3. If the question references YOUR email, use: {user_email}
+4. If the question references "<your email>", replace it with: {user_email}
+5. For audio files: acknowledge you cannot transcribe but need external service
+6. Return answers in the EXACT format requested (string, number, boolean, object)
+
+SPECIAL CASES:
+- Command strings: Return EXACTLY as shown in example, replacing placeholders with actual values
+- Email placeholders: Always replace "<your email>" with {user_email}
+- Git commands: Return exact command strings as requested
+- File paths: Return exact paths as shown
+- Audio transcription: Indicate need for transcription service
 
 ANSWER FORMAT GUIDE:
-- If asking for a number (sum, count, average): return as integer or float
-- If asking for text (code, name, secret): return as string
-- If asking for yes/no: return as boolean (true/false)
-- If asking for multiple values: return as array or object
+- Command/code string → return as string exactly as shown
+- Number (sum, count) → return as integer or float
+- Text (name, secret, path) → return as string
+- Yes/no → return as boolean (true/false)
+- Multiple values → return as array or object
 
-CALCULATION EXAMPLES:
-- "sum of column X" → Calculate: sum of all values in column X from the data
-- "count rows where Y > 10" → Count: number of rows meeting condition
-- "average of Z" → Calculate: mean of column Z
-- "value on page 2" → Extract: from page 2 of the PDF data
-- "secret code" → Extract: the actual code from scraped content
+EXAMPLES:
+- Question: "Submit the command: uv http get..." → Answer: "uv http get https://example.com?email={user_email}"
+- Question: "Submit: git add env.sample" → Answer: "git add env.sample\ngit commit -m \"message\""
+- Question: "What is the sum of X?" → Answer: 12345 (calculated from data)
+- Question: "Transcribe audio file" → Acknowledge cannot transcribe without service
 
 CRITICAL RULES:
-✓ Use ACTUAL data provided above
-✗ Do NOT use example values from the question
-✓ Perform EXACT calculations (don't round unless asked)
+✓ If question shows example command with <your email>, replace with {user_email}
+✓ Return command strings EXACTLY as formatted in question
+✓ For multi-line commands, preserve line breaks
+✗ Do NOT add extra quotes or escaping unless shown in example
 ✗ Do NOT return placeholder values like "N/A", "null", "your_answer"
-✓ Match the data type requested (number vs string vs boolean)
-✗ Do NOT guess - analyze the data carefully
+✓ For calculations, use ACTUAL data provided
+✗ Do NOT guess - if you need transcription service, say so
 
 Return ONLY valid JSON (no markdown, no code blocks):
 {{
-    "answer": <your_calculated_answer>,
-    "reasoning": "step-by-step: 1) identified question asks for X, 2) found data in Y, 3) calculated/extracted as Z",
+    "answer": <your_exact_answer>,
+    "reasoning": "step-by-step explanation of your answer",
     "confidence": "high/medium/low",
-    "data_used": "which data source/column was used"
+    "data_used": "which data/command was used"
 }}
 
-IMPORTANT: Your answer MUST come from analyzing the actual data above."""
+IMPORTANT: 
+- If question asks for a command, return it as a string
+- If email is mentioned, use {user_email}
+- If audio file needs transcription, explain limitation clearly"""
 
     try:
         logger.info("🤖 Querying LLM...")
@@ -712,7 +751,7 @@ IMPORTANT: Your answer MUST come from analyzing the actual data above."""
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a precise data analyst. Analyze data carefully, perform exact calculations, and return valid JSON with the correct answer type. Never use placeholder values."
+                    "content": "You are a precise data analyst and command-line expert. Return exact commands/strings as shown in questions. Replace <your email> with actual user email. For audio files, acknowledge transcription limitations. Return valid JSON."
                 },
                 {"role": "user", "content": prompt}
             ],
@@ -756,10 +795,17 @@ IMPORTANT: Your answer MUST come from analyzing the actual data above."""
         # Validate answer is not placeholder/invalid
         invalid_answers = [
             "", None, "N/A", "null", "placeholder", "<answer>", 
-            "your_answer", "your answer", "calculate this", "TODO"
+            "your_answer", "your answer", "calculate this", "TODO",
+            "<your email>"
         ]
         
         answer_str = str(answer).lower().strip() if answer is not None else ""
+        
+        # Check if answer contains unresolved placeholders
+        if answer and isinstance(answer, str) and "<your email>" in answer:
+            logger.warning("⚠️ Answer still contains <your email> placeholder, fixing...")
+            answer = answer.replace("<your email>", user_email)
+            solution["answer"] = answer
         
         if answer in invalid_answers or answer_str in invalid_answers:
             logger.warning("⚠️ LLM returned invalid/placeholder answer, retrying with emphasis...")
@@ -767,31 +813,38 @@ IMPORTANT: Your answer MUST come from analyzing the actual data above."""
             # Retry with more explicit instructions
             retry_prompt = f"""PREVIOUS ATTEMPT FAILED - You returned a placeholder/invalid answer.
 
-The question is asking for a SPECIFIC value that can be calculated or extracted from the data.
+USER EMAIL TO USE: {user_email}
 
-QUESTION (Read carefully):
-{page_text[:4000]}
+The question is asking for a SPECIFIC value, command, or acknowledgment.
+
+QUESTION (Read VERY carefully):
+{page_text[:6000]}
 
 DATA (Analyze this):
-{context_str[:15000]}
+{context_str[:20000]}
 
 STEP-BY-STEP PROCESS:
-1. What is the question asking for? (e.g., sum of column X, secret code, count of rows)
-2. Where is this information in the data? (which file, which column, which page)
-3. What is the calculation? (sum, count, extract, filter, etc.)
-4. What is the ACTUAL value? (calculate it precisely from the data)
+1. What EXACTLY is the question asking for?
+2. Is it asking for:
+   - A command string? → Return the exact command with {user_email} replacing any email placeholder
+   - A calculation? → Calculate from provided data
+   - File path? → Return exact path shown
+   - Audio transcription? → Acknowledge limitation and explain need for transcription service
+   - Text extraction? → Extract from data
 
-Example thinking:
-- If question asks "sum of 'value' column" → Find 'value' column in data → Calculate sum of all numbers
-- If question asks "secret on page 2" → Find page 2 in PDF data → Extract the secret text
+3. For COMMANDS: Copy the exact format from the question, replacing:
+   - "<your email>" with {user_email}
+   - Any other placeholders with actual values
 
-Return valid JSON with the ACTUAL answer (must be a real value, not placeholder):
+4. For AUDIO files: Return a clear statement like "Cannot transcribe audio file without transcription service. Audio file detected at [URL]."
+
+Return valid JSON with the ACTUAL answer:
 {{
-    "answer": <actual_calculated_value>,
-    "reasoning": "detailed explanation of how you got this answer"
+    "answer": <actual_value_or_command_or_acknowledgment>,
+    "reasoning": "detailed step-by-step explanation"
 }}
 
-DO NOT RETURN: null, N/A, placeholder, empty string, or example values from the question itself."""
+DO NOT RETURN: null, N/A, placeholder, empty string, or unresolved placeholders like "<your email>"."""
 
             try:
                 retry_response = client.chat.completions.create(
@@ -799,7 +852,7 @@ DO NOT RETURN: null, N/A, placeholder, empty string, or example values from the 
                     messages=[
                         {
                             "role": "system",
-                            "content": "You must return the actual answer calculated from the data. No placeholders allowed."
+                            "content": f"You must return the actual answer. User email is {user_email}. Replace ALL email placeholders. For audio, acknowledge transcription limitation. No placeholders allowed."
                         },
                         {"role": "user", "content": retry_prompt}
                     ],
@@ -812,16 +865,35 @@ DO NOT RETURN: null, N/A, placeholder, empty string, or example values from the 
                 try:
                     solution = json.loads(retry_text)
                     answer = solution.get("answer")
+                    
+                    # Fix email placeholder again if present
+                    if answer and isinstance(answer, str) and "<your email>" in answer:
+                        answer = answer.replace("<your email>", user_email)
+                        solution["answer"] = answer
+                    
                     logger.info(f"✅ Retry successful, new answer: {answer}")
                 except:
                     logger.error("❌ Retry JSON parsing also failed")
+                    # Try to at least extract text
+                    if "cannot" in retry_text.lower() and "audio" in retry_text.lower():
+                        return {
+                            "answer": "Audio transcription requires external service - file detected but cannot be processed",
+                            "reasoning": "Audio file needs transcription service",
+                            "confidence": "medium"
+                        }
                     return {
                         "error": "Could not get valid answer after retry",
                         "raw": retry_text[:1500]
                     }
             except Exception as e:
                 logger.error(f"❌ Retry request failed: {e}")
-                # Continue with original answer despite being invalid
+                # For audio files, provide fallback
+                if any('audio' in str(file_data.get('type', '')) for file_data in downloaded_files.values()):
+                    return {
+                        "answer": "Audio transcription service required - cannot process audio files directly",
+                        "reasoning": "Audio file detected but transcription service unavailable",
+                        "confidence": "low"
+                    }
         
         # Log the final answer
         answer_type = type(answer).__name__
@@ -950,7 +1022,7 @@ def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: fl
         remaining = timeout - elapsed
         
         # Check if we're running out of time
-        if remaining < 30:
+        if remaining < 25:
             logger.warning(f"⚠️ Only {remaining:.1f}s remaining, stopping chain")
             results.append({
                 "quiz_number": iteration,
@@ -1008,7 +1080,9 @@ def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: fl
             
             download_extensions = [
                 '.pdf', '.csv', '.json', '.xlsx', '.xls', 
-                '.txt', '.xml', '.tsv', '.dat'
+                '.txt', '.xml', '.tsv', '.dat',
+                '.opus', '.mp3', '.wav', '.ogg', '.m4a', '.flac',  # Audio
+                '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'  # Images
             ]
             
             for link in links:
@@ -1020,7 +1094,7 @@ def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: fl
                 
                 if any(path.endswith(ext) for ext in download_extensions):
                     download_links.append(link)
-                elif len(scrape_links) < 5:  # Limit scraping
+                elif len(scrape_links) < 3:  # Limit scraping to save time
                     scrape_links.append(link)
             
             # Parallel file downloads
@@ -1043,7 +1117,7 @@ def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: fl
             for link in scrape_links:
                 logger.info(f"🌐 Scraping page: {link}")
                 try:
-                    scraped = extract_page_content(link, max_wait=5)
+                    scraped = extract_page_content(link, max_wait=4)
                     if not scraped.get("error") and scraped.get("text"):
                         downloaded_files[link] = {
                             "type": "scraped_page",
@@ -1056,7 +1130,7 @@ def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: fl
             logger.info(f"✅ Processed {len(downloaded_files)} data sources")
             
             # Step 4: Solve with LLM
-            solution = solve_with_llm(quiz_page, downloaded_files, current_url)
+            solution = solve_with_llm(quiz_page, downloaded_files, current_url, email)
             
             if "error" in solution:
                 logger.error(f"❌ LLM solving failed: {solution.get('error')}")
@@ -1141,20 +1215,18 @@ def home():
     """Home endpoint - service info"""
     return jsonify({
         "service": "Enhanced Dynamic Quiz Solver",
-        "version": "5.1",
+        "version": "5.2",
         "status": "running",
         "model": AIMLAPI_MODEL,
         "capabilities": [
             "JavaScript-rendered web scraping",
-            "Comprehensive statistical analysis (mean, median, std, quartiles, IQR)",
-            "ML predictions & classifications",
-            "Data filtering, aggregation & transformation",
-            "Complex calculations (z-scores, probabilities, distributions)",
-            "Visualization & narrative generation",
-            "Multi-format file parsing (PDF, CSV, Excel, JSON, Text)",
-            "API integration & data sourcing",
+            "Command string extraction and formatting",
+            "Email placeholder replacement",
+            "Audio/image file detection",
+            "Comprehensive statistical analysis",
+            "Multi-format file parsing (PDF, CSV, Excel, JSON, Text, Audio, Images)",
             "Intelligent answer type detection",
-            "Automatic retry on failures",
+            "Automatic retry with improved prompts",
             "Smart caching for performance",
             "Parallel file downloads"
         ],
@@ -1166,7 +1238,10 @@ def home():
             "dynamic_submit_url": True,
             "comprehensive_stats": True,
             "parallel_downloads": True,
-            "smart_id_detection": True
+            "smart_id_detection": True,
+            "command_string_formatting": True,
+            "email_placeholder_replacement": True,
+            "audio_detection": True
         }
     }), 200
 
@@ -1292,7 +1367,7 @@ if __name__ == "__main__":
     
     logger.info(f"\n{'='*70}")
     logger.info(f"🚀 Enhanced Dynamic Quiz Solver")
-    logger.info(f"   Version: 5.1 (Fixed)")
+    logger.info(f"   Version: 5.2 (Fixed - Command Support)")
     logger.info(f"   Port: {port}")
     logger.info(f"   Model: {AIMLAPI_MODEL}")
     logger.info(f"   LLM: {'✅ Ready' if client else '❌ Not initialized'}")
