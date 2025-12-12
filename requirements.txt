@@ -23,7 +23,7 @@ PyPDF2==3.0.1
 openpyxl==3.1.2
 python-docx==1.1.0
 
-# Image Processing
+# Image Processing (ADDED FOR IMAGE ANALYSIS)
 Pillow==10.1.0
 
 # Web Scraping
