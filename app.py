@@ -13,6 +13,7 @@ import io
 import traceback
 from urllib.parse import urljoin, urlparse
 from typing import Dict, List, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Flask, request, jsonify
 from selenium import webdriver
@@ -124,6 +125,9 @@ def extract_page_content(url: str, max_wait: int = 10) -> Dict[str, Any]:
         previous_html_length = 0
         stable_count = 0
         
+        # Keywords that indicate quiz content has loaded
+        critical_keywords = ["result", "quiz", "question", "data", "download", "submit", "answer"]
+        
         for i in range(max_wait):
             time.sleep(1)
             
@@ -135,10 +139,14 @@ def extract_page_content(url: str, max_wait: int = 10) -> Dict[str, Any]:
                 current_text = driver.find_element(By.TAG_NAME, "body").text
                 current_html_length = len(driver.page_source)
             
+            # Check if critical content exists
+            has_critical_content = any(keyword in current_text.lower() for keyword in critical_keywords)
+            
             # Check if content has stabilized
             if (current_text == previous_text and 
                 current_html_length == previous_html_length and 
-                len(current_text) > 50):
+                len(current_text) > 50 and
+                has_critical_content):
                 stable_count += 1
                 if stable_count >= 2:
                     logger.info(f"✅ Content stabilized after {i+1}s")
@@ -317,11 +325,21 @@ def parse_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
                     for table_idx, table in enumerate(tables):
                         if table and len(table) > 0:
                             try:
+                                # Detect if first row looks like headers
+                                first_row = table[0]
+                                looks_like_header = (
+                                    len(table) > 1 and 
+                                    all(isinstance(cell, str) and cell and 
+                                        not (str(cell).replace('.','').replace('-','').replace(',','').isdigit())
+                                        for cell in first_row if cell)
+                                )
+                                
                                 # Create DataFrame
-                                if len(table) > 1:
+                                if looks_like_header:
                                     df = pd.DataFrame(table[1:], columns=table[0])
                                 else:
                                     df = pd.DataFrame(table)
+                                    df.columns = [f"Column_{i}" for i in range(len(df.columns))]
                                 
                                 table_info = {
                                     "index": table_idx,
@@ -371,16 +389,21 @@ def parse_csv(csv_content: bytes) -> Dict[str, Any]:
         # Clean column names
         df.columns = [str(col).strip() for col in df.columns]
         
-        # Try to convert string numbers to numeric
+        # Try to convert string numbers to numeric (more conservative approach)
         for col in df.columns:
             if df[col].dtype == 'object':
                 try:
                     # Remove common formatting
                     cleaned = df[col].astype(str).str.replace(r'[$,€£¥\s%]', '', regex=True)
                     numeric_col = pd.to_numeric(cleaned, errors='coerce')
-                    # Only convert if we get reasonable results
-                    if numeric_col.notna().sum() > len(df) * 0.5:
+                    
+                    # Check if values have leading zeros (likely IDs/codes, not numbers)
+                    has_leading_zeros = df[col].astype(str).str.match(r'^0\d').any()
+                    
+                    # Only convert if 80%+ are numeric AND no leading zeros
+                    if (numeric_col.notna().sum() > len(df) * 0.8 and not has_leading_zeros):
                         df[col] = numeric_col
+                        logger.info(f"  🔢 Converted '{col}' to numeric")
                 except:
                     pass
         
@@ -436,6 +459,26 @@ def parse_csv(csv_content: bytes) -> Dict[str, Any]:
             
             column_analysis[col] = analysis
         
+        # Smarter data sampling - include first, last, and middle rows
+        if len(df) <= 300:
+            data_sample = df.to_dict('records')
+        else:
+            sample_data = (
+                df.head(100).to_dict('records') +  # First 100
+                df.tail(100).to_dict('records') +  # Last 100
+                df.sample(n=min(100, len(df)-200)).to_dict('records')  # 100 random from middle
+            )
+            # Remove duplicates while preserving order
+            seen = set()
+            data_sample = []
+            for item in sample_data:
+                item_str = json.dumps(item, sort_keys=True)
+                if item_str not in seen:
+                    seen.add(item_str)
+                    data_sample.append(item)
+                if len(data_sample) >= 300:
+                    break
+        
         result = {
             "shape": list(df.shape),
             "row_count": len(df),
@@ -444,7 +487,7 @@ def parse_csv(csv_content: bytes) -> Dict[str, Any]:
             "column_analysis": column_analysis,
             "first_rows": df.head(20).to_dict('records'),
             "last_rows": df.tail(10).to_dict('records'),
-            "data_sample": df.to_dict('records')[:300] if len(df) <= 300 else df.sample(n=300).to_dict('records')
+            "data_sample": data_sample
         }
         
         logger.info(f"✅ CSV: {df.shape[0]} rows × {df.shape[1]} columns")
@@ -544,8 +587,8 @@ def extract_submit_url(content: str, base_url: str) -> Optional[str]:
     if matches:
         return matches[0]
     
-    # Strategy 5: Fallback - construct from base URL
-    if 'submit' in content.lower():
+    # Strategy 5: Fallback - construct from base URL ONLY if we see JSON payload structure
+    if 'submit' in content.lower() and '"url"' in content and '"answer"' in content:
         fallback_url = f"{base_domain}/submit"
         logger.info(f"⚠️ Using fallback submit URL: {fallback_url}")
         return fallback_url
@@ -569,8 +612,51 @@ def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], 
     logger.info(f"📄 Question length: {len(page_text)} chars")
     logger.info(f"📦 Data files: {len(downloaded_files)}")
     
-    # Build comprehensive context
-    context_str = json.dumps(downloaded_files, indent=2, default=str)[:20000]
+    # Build comprehensive context with smart truncation per file
+    context_parts = {}
+    total_size = 0
+    max_total_size = 30000  # Increased limit
+    
+    for url, file_data in downloaded_files.items():
+        file_str = json.dumps(file_data, indent=2, default=str)
+        
+        # If file is too large, create summary
+        if len(file_str) > 5000:
+            summary = {
+                "type": file_data.get("type"),
+                "url": url,
+                "size_chars": len(file_str)
+            }
+            
+            # Include key parts based on file type
+            if file_data.get("type") == "csv" and "content" in file_data:
+                content = file_data["content"]
+                summary["columns"] = content.get("columns", [])
+                summary["column_analysis"] = content.get("column_analysis", {})
+                summary["row_count"] = content.get("row_count", 0)
+                summary["first_rows"] = content.get("first_rows", [])[:10]
+                summary["last_rows"] = content.get("last_rows", [])[:5]
+            elif file_data.get("type") == "pdf" and "content" in file_data:
+                content = file_data["content"]
+                summary["page_count"] = content.get("page_count", 0)
+                summary["all_text"] = content.get("all_text", "")[:3000]
+                summary["all_tables"] = content.get("all_tables", [])
+            else:
+                summary["content_preview"] = str(file_data.get("content", ""))[:3000]
+            
+            context_parts[url] = summary
+            total_size += len(json.dumps(summary))
+        else:
+            context_parts[url] = file_data
+            total_size += len(file_str)
+        
+        # Stop if we're approaching limit
+        if total_size > max_total_size:
+            logger.warning(f"⚠️ Context size limit reached at {total_size} chars")
+            break
+    
+    context_str = json.dumps(context_parts, indent=2, default=str)
+    logger.info(f"📊 Context size: {len(context_str)} chars")
     
     # Create the prompt
     prompt = f"""You are a precise data analyst solving a quiz. Your job is to read the question carefully, analyze the provided data, and return the EXACT answer requested.
@@ -877,7 +963,7 @@ def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: fl
         logger.info(f"\n{'='*70}")
         logger.info(f"🎯 QUIZ #{iteration}")
         logger.info(f"🔗 URL: {current_url}")
-        logger.info(f"⏱️  Elapsed: {elapsed:.1f}s | Remaining: {remaining:.1f}s")
+        logger.info(f"⏱️ Elapsed: {elapsed:.1f}s | Remaining: {remaining:.1f}s")
         logger.info(f"{'='*70}")
         
         try:
@@ -910,46 +996,62 @@ def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: fl
             
             logger.info(f"✅ Submit URL: {submit_url}")
             
-            # Step 3: Download and parse all linked files
+            # Step 3: Download and parse all linked files (with parallel processing)
             downloaded_files = {}
             links = quiz_page.get("links", [])
             
             logger.info(f"🔍 Found {len(links)} links to process")
             
+            # Separate download and scrape links
+            download_links = []
+            scrape_links = []
+            
+            download_extensions = [
+                '.pdf', '.csv', '.json', '.xlsx', '.xls', 
+                '.txt', '.xml', '.tsv', '.dat'
+            ]
+            
             for link in links:
-                # Skip submit URLs
                 if 'submit' in link.lower():
                     continue
                 
-                # Determine if we should download or scrape
                 parsed_link = urlparse(link)
                 path = parsed_link.path.lower()
                 
-                # Known file extensions to download
-                download_extensions = [
-                    '.pdf', '.csv', '.json', '.xlsx', '.xls', 
-                    '.txt', '.xml', '.tsv', '.dat'
-                ]
-                
-                should_download = any(path.endswith(ext) for ext in download_extensions)
-                
-                if should_download:
-                    logger.info(f"📥 Downloading file: {link}")
-                    file_content = download_file(link)
-                    if file_content:
-                        parsed = smart_parse_file(file_content, link)
-                        downloaded_files[link] = parsed
-                else:
-                    # Scrape as a page (might contain additional data)
-                    if len(downloaded_files) < 5:  # Limit scraping to prevent timeout
-                        logger.info(f"🌐 Scraping page: {link}")
-                        scraped = extract_page_content(link, max_wait=5)
-                        if not scraped.get("error") and scraped.get("text"):
-                            downloaded_files[link] = {
-                                "type": "scraped_page",
-                                "content": scraped.get("text", ""),
-                                "url": link
-                            }
+                if any(path.endswith(ext) for ext in download_extensions):
+                    download_links.append(link)
+                elif len(scrape_links) < 5:  # Limit scraping
+                    scrape_links.append(link)
+            
+            # Parallel file downloads
+            if download_links:
+                logger.info(f"📥 Downloading {len(download_links)} files in parallel...")
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    future_to_url = {executor.submit(download_file, link): link for link in download_links}
+                    
+                    for future in as_completed(future_to_url):
+                        link = future_to_url[future]
+                        try:
+                            file_content = future.result()
+                            if file_content:
+                                parsed = smart_parse_file(file_content, link)
+                                downloaded_files[link] = parsed
+                        except Exception as e:
+                            logger.error(f"❌ Error processing {link}: {e}")
+            
+            # Sequential page scraping (less critical)
+            for link in scrape_links:
+                logger.info(f"🌐 Scraping page: {link}")
+                try:
+                    scraped = extract_page_content(link, max_wait=5)
+                    if not scraped.get("error") and scraped.get("text"):
+                        downloaded_files[link] = {
+                            "type": "scraped_page",
+                            "content": scraped.get("text", ""),
+                            "url": link
+                        }
+                except Exception as e:
+                    logger.error(f"❌ Error scraping {link}: {e}")
             
             logger.info(f"✅ Processed {len(downloaded_files)} data sources")
             
@@ -1010,7 +1112,7 @@ def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: fl
             next_url = submission.get("url")
             
             if next_url:
-                logger.info(f"➡️  Next quiz: {next_url}")
+                logger.info(f"➡️ Next quiz: {next_url}")
                 current_url = next_url
             else:
                 logger.info("🏁 Quiz chain complete!")
@@ -1039,7 +1141,7 @@ def home():
     """Home endpoint - service info"""
     return jsonify({
         "service": "Enhanced Dynamic Quiz Solver",
-        "version": "5.0",
+        "version": "5.1",
         "status": "running",
         "model": AIMLAPI_MODEL,
         "capabilities": [
@@ -1053,7 +1155,8 @@ def home():
             "API integration & data sourcing",
             "Intelligent answer type detection",
             "Automatic retry on failures",
-            "Smart caching for performance"
+            "Smart caching for performance",
+            "Parallel file downloads"
         ],
         "max_time_per_quiz_chain": "170 seconds",
         "features": {
@@ -1061,7 +1164,9 @@ def home():
             "retry_on_failure": True,
             "multi_format_parsing": True,
             "dynamic_submit_url": True,
-            "comprehensive_stats": True
+            "comprehensive_stats": True,
+            "parallel_downloads": True,
+            "smart_id_detection": True
         }
     }), 200
 
@@ -1152,8 +1257,8 @@ def quiz_endpoint():
         logger.info(f"🏁 QUIZ CHAIN COMPLETED")
         logger.info(f"   ✅ Correct: {num_correct}")
         logger.info(f"   ❌ Incorrect: {num_incorrect}")
-        logger.info(f"   ⚠️  Errors: {num_errors}")
-        logger.info(f"   ⏱️  Total time: {total_time:.2f}s")
+        logger.info(f"   ⚠️ Errors: {num_errors}")
+        logger.info(f"   ⏱️ Total time: {total_time:.2f}s")
         logger.info(f"{'='*70}")
         
         return jsonify({
@@ -1187,7 +1292,7 @@ if __name__ == "__main__":
     
     logger.info(f"\n{'='*70}")
     logger.info(f"🚀 Enhanced Dynamic Quiz Solver")
-    logger.info(f"   Version: 5.0")
+    logger.info(f"   Version: 5.1 (Fixed)")
     logger.info(f"   Port: {port}")
     logger.info(f"   Model: {AIMLAPI_MODEL}")
     logger.info(f"   LLM: {'✅ Ready' if client else '❌ Not initialized'}")
