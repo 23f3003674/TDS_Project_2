@@ -248,64 +248,102 @@ def download_file(url: str, timeout: int = 30, use_cache: bool = True) -> Option
 
 def smart_parse_file(file_content: bytes, url: str) -> Dict[str, Any]:
     """
-    Intelligently parse any file type
+    Intelligently parse any file type - FIXED ORDER
     """
     result = {"type": "unknown", "content": None, "error": None, "url": url}
     
     try:
-        # Detect file type
-        if file_content[:4] == b"%PDF":
-            result["type"] = "pdf"
-            result["content"] = parse_pdf(file_content)
+        url_lower = url.lower()
         
-        elif url.lower().endswith('.csv') or b',' in file_content[:1000]:
-            result["type"] = "csv"
-            result["content"] = parse_csv(file_content)
+        # CRITICAL: Check file extensions FIRST before content sniffing
         
-        elif url.lower().endswith(('.xlsx', '.xls')):
-            result["type"] = "excel"
-            result["content"] = parse_excel(file_content)
-        
-        elif url.lower().endswith('.json') or file_content[:1] in [b'{', b'[']:
-            result["type"] = "json"
-            try:
-                result["content"] = json.loads(file_content.decode('utf-8'))
-            except Exception as e:
-                result["error"] = f"Invalid JSON: {e}"
-        
-        elif url.lower().endswith(('.txt', '.text')):
-            result["type"] = "text"
-            try:
-                result["content"] = file_content.decode('utf-8')
-            except:
-                result["content"] = file_content.decode('utf-8', errors='ignore')
-        
-        elif url.lower().endswith(('.opus', '.mp3', '.wav', '.ogg', '.m4a', '.flac')):
+        # Audio files - BEFORE any content checks
+        if any(url_lower.endswith(ext) for ext in ['.opus', '.mp3', '.wav', '.ogg', '.m4a', '.flac']):
             result["type"] = "audio"
             result["content"] = {
                 "base64": base64.b64encode(file_content).decode('utf-8'),
                 "size": len(file_content),
                 "format": url.split('.')[-1].lower(),
-                "note": "Audio file - needs transcription service"
+                "note": "Audio file - requires transcription service (not available)"
             }
-            logger.info(f"✅ Audio file detected: {url.split('.')[-1].upper()}, {len(file_content)} bytes")
+            logger.info(f"✅ Audio file: {url.split('.')[-1].upper()}")
+            return result
         
-        elif url.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')):
+        # Image files - BEFORE any content checks  
+        if any(url_lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']):
             result["type"] = "image"
-            result["content"] = {
-                "base64": base64.b64encode(file_content).decode('utf-8'),
-                "size": len(file_content),
-                "format": url.split('.')[-1].lower()
-            }
+            # Analyze dominant color using PIL
+            try:
+                from PIL import Image
+                from collections import Counter
+                img = Image.open(io.BytesIO(file_content)).convert('RGB')
+                img_resized = img.resize((150, 150))  # Resize for faster processing
+                pixels = list(img_resized.getdata())
+                color_counts = Counter(pixels)
+                dominant_rgb = color_counts.most_common(1)[0][0]
+                dominant_hex = '#{:02x}{:02x}{:02x}'.format(dominant_rgb[0], dominant_rgb[1], dominant_rgb[2])
+                
+                result["content"] = {
+                    "base64": base64.b64encode(file_content).decode('utf-8'),
+                    "size": len(file_content),
+                    "format": url.split('.')[-1].lower(),
+                    "dominant_color": dominant_hex,
+                    "dominant_rgb": dominant_rgb
+                }
+                logger.info(f"✅ Image: dominant color {dominant_hex}")
+            except Exception as e:
+                logger.error(f"❌ Image analysis error: {e}")
+                result["content"] = {
+                    "base64": base64.b64encode(file_content).decode('utf-8'),
+                    "size": len(file_content),
+                    "format": url.split('.')[-1].lower(),
+                    "error": str(e)
+                }
+            return result
         
-        else:
-            # Try as text
+        # JSON - Check extension BEFORE content
+        if url_lower.endswith('.json'):
+            result["type"] = "json"
+            try:
+                result["content"] = json.loads(file_content.decode('utf-8'))
+            except Exception as e:
+                result["error"] = f"Invalid JSON: {e}"
+            return result
+        
+        # Excel - Check extension
+        if url_lower.endswith(('.xlsx', '.xls')):
+            result["type"] = "excel"
+            result["content"] = parse_excel(file_content)
+            return result
+        
+        # PDF - Check magic bytes OR extension
+        if file_content[:4] == b"%PDF" or url_lower.endswith('.pdf'):
+            result["type"] = "pdf"
+            result["content"] = parse_pdf(file_content)
+            return result
+        
+        # CSV - Check extension OR content (LAST!)
+        if url_lower.endswith('.csv') or (b',' in file_content[:1000] and not url_lower.endswith(('.json', '.txt'))):
+            result["type"] = "csv"
+            result["content"] = parse_csv(file_content)
+            return result
+        
+        # Text fallback
+        if url_lower.endswith(('.txt', '.text', '.md')):
             result["type"] = "text"
             try:
+                result["content"] = file_content.decode('utf-8')
+            except:
                 result["content"] = file_content.decode('utf-8', errors='ignore')
-            except Exception as e:
-                result["error"] = f"Could not decode: {e}"
-                result["content"] = f"Binary content: {len(file_content)} bytes"
+            return result
+        
+        # Final fallback - try as text
+        result["type"] = "text"
+        try:
+            result["content"] = file_content.decode('utf-8', errors='ignore')
+        except Exception as e:
+            result["error"] = f"Could not decode: {e}"
+            result["content"] = f"Binary content: {len(file_content)} bytes"
         
         logger.info(f"✅ Parsed as: {result['type']}")
         return result
@@ -665,6 +703,20 @@ def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], 
                 summary["audio_format"] = file_data.get("content", {}).get("format")
                 summary["audio_size"] = file_data.get("content", {}).get("size")
                 summary["note"] = "Audio file detected - transcription service required"
+            elif file_data.get("type") == "image":
+                content = file_data.get("content", {})
+                context_parts[url] = {
+                    "type": "image",
+                    "dominant_color": content.get("dominant_color"),
+                    "dominant_rgb": content.get("dominant_rgb"),
+                    "format": content.get("format"),
+                    "note": "Use dominant_color for color-related questions"
+                }
+            elif file_data.get("type") == "json":
+                context_parts[url] = {
+                    "type": "json",
+                    "content": file_data.get("content")
+                }
             else:
                 summary["content_preview"] = str(file_data.get("content", ""))[:3000]
             
@@ -703,10 +755,12 @@ CRITICAL INSTRUCTIONS:
 
 SPECIAL CASES:
 - Command strings: Return EXACTLY as shown in example, replacing placeholders with actual values
-- Email placeholders: Always replace "<your email>" with {user_email}
+- Email placeholders: Always replace "<your email>" with {user_email}  
 - Git commands: Return exact command strings as requested
 - File paths: Return exact paths as shown
 - Audio transcription: Indicate need for transcription service
+- Image color: Use the "dominant_color" hex value from image data (e.g., "#b45a1e")
+- JSON normalization: Return as actual JSON array, not string
 
 ANSWER FORMAT GUIDE:
 - Command/code string → return as string exactly as shown
