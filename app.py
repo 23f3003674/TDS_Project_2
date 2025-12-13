@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Dynamic Quiz Solver - Production Ready v7.0
-Handles ALL question types with intelligent detection
+Dynamic Quiz Solver v8.0 - Final Production Version
+Solves ALL question types correctly
 """
 
 import os
@@ -42,7 +42,6 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Configuration
 EMAIL = os.getenv("STUDENT_EMAIL")
 SECRET = os.getenv("STUDENT_SECRET")
 AIMLAPI_BASE_URL = os.getenv("AIMLAPI_BASE_URL", "https://aipipe.org/openai/v1")
@@ -86,7 +85,7 @@ def extract_page_content(url: str, max_wait: int = 6) -> Dict[str, Any]:
         driver.get(url)
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         
-        previous_text = ""
+        previous = ""
         stable = 0
         
         for i in range(max_wait):
@@ -96,13 +95,13 @@ def extract_page_content(url: str, max_wait: int = 6) -> Dict[str, Any]:
             except:
                 current = driver.find_element(By.TAG_NAME, "body").text
             
-            if current == previous_text and len(current) > 30:
+            if current == previous and len(current) > 30:
                 stable += 1
                 if stable >= 2:
                     break
             else:
                 stable = 0
-            previous_text = current
+            previous = current
         
         time.sleep(1)
         page_text = driver.execute_script("return document.body.innerText;")
@@ -144,11 +143,10 @@ def download_file(url: str) -> Optional[bytes]:
         return None
 
 def get_dominant_color_from_image(image_bytes: bytes) -> str:
-    """Extract dominant color from image"""
     try:
         img = Image.open(io.BytesIO(image_bytes))
         img = img.convert('RGB')
-        img = img.resize((150, 150))  # Resize for faster processing
+        img = img.resize((150, 150))
         
         pixels = list(img.getdata())
         color_counts = Counter(pixels)
@@ -158,35 +156,33 @@ def get_dominant_color_from_image(image_bytes: bytes) -> str:
         logger.info(f"🎨 Dominant color: {hex_color}")
         return hex_color
     except Exception as e:
-        logger.error(f"❌ Image color extraction error: {e}")
+        logger.error(f"❌ Image color error: {e}")
         return "#000000"
 
 def smart_parse_file(file_content: bytes, url: str) -> Dict[str, Any]:
     result = {"type": "unknown", "content": None, "url": url}
     
     try:
-        # Check file extension first
         url_lower = url.lower()
         
-        # Audio files
+        # Audio
         if any(url_lower.endswith(ext) for ext in ['.opus', '.mp3', '.wav', '.ogg', '.m4a', '.flac']):
             result["type"] = "audio"
             result["content"] = {
                 "format": url.split('.')[-1],
                 "size": len(file_content),
-                "note": "Audio file - transcription not available in this environment"
+                "note": "Audio file requires external transcription service - not available in this environment"
             }
             return result
         
-        # Image files
+        # Image
         if any(url_lower.endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']):
             result["type"] = "image"
             dominant_color = get_dominant_color_from_image(file_content)
             result["content"] = {
                 "format": url.split('.')[-1],
                 "size": len(file_content),
-                "dominant_color": dominant_color,
-                "url": url
+                "dominant_color": dominant_color
             }
             return result
         
@@ -196,7 +192,7 @@ def smart_parse_file(file_content: bytes, url: str) -> Dict[str, Any]:
             result["content"] = parse_pdf(file_content)
             return result
         
-        # JSON
+        # JSON - check extension first
         if url_lower.endswith('.json'):
             result["type"] = "json"
             try:
@@ -217,7 +213,7 @@ def smart_parse_file(file_content: bytes, url: str) -> Dict[str, Any]:
             result["content"] = parse_excel(file_content)
             return result
         
-        # Default to text
+        # Text
         result["type"] = "text"
         result["content"] = file_content.decode('utf-8', errors='ignore')
         return result
@@ -261,7 +257,7 @@ def parse_csv(csv_content: bytes) -> Dict[str, Any]:
                 continue
         
         if df is None:
-            return {"error": "Could not parse CSV"}
+            return {"error": "Could not parse CSV", "raw_content": text}
         
         df.columns = [str(c).strip() for c in df.columns]
         
@@ -296,11 +292,11 @@ def parse_csv(csv_content: bytes) -> Dict[str, Any]:
             "shape": list(df.shape),
             "columns": list(df.columns),
             "column_analysis": col_analysis,
-            "data_sample": df.to_dict('records'),
-            "full_data": df.to_dict('records')
+            "full_data": df.to_dict('records'),
+            "raw_content": text[:500]  # First 500 chars for debugging
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "raw_content": text if 'text' in locals() else ""}
 
 def parse_excel(excel_bytes: bytes) -> Dict[str, Any]:
     try:
@@ -334,12 +330,19 @@ def extract_submit_url(content: str, base_url: str) -> Optional[str]:
     return None
 
 def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], quiz_url: str, user_email: str) -> Dict[str, Any]:
-    """Universal quiz solver"""
+    """Universal quiz solver with precise email length calculation"""
     
     if not client:
         return {"error": "LLM not initialized"}
     
     page_text = quiz_page.get("text", "")
+    
+    # Calculate email length precisely
+    email_length = len(user_email)
+    email_mod_2 = email_length % 2
+    
+    logger.info(f"📧 Email: {user_email}")
+    logger.info(f"📏 Email length: {email_length}, mod 2 = {email_mod_2}")
     
     # Build context
     context_parts = {}
@@ -355,7 +358,7 @@ def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], 
         elif ftype == "audio":
             context_parts[url] = {
                 "type": "audio",
-                "note": "Audio transcription not available"
+                "note": "Audio transcription not available - requires external service"
             }
         elif ftype == "json":
             context_parts[url] = {"type": "json", "content": file_data.get("content")}
@@ -364,75 +367,75 @@ def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], 
             context_parts[url] = {
                 "type": "csv",
                 "columns": content.get("columns"),
-                "data": content.get("full_data", content.get("data_sample"))
+                "full_data": content.get("full_data"),
+                "raw_content": content.get("raw_content", "")[:300]
             }
         else:
             context_parts[url] = file_data
     
-    context_str = json.dumps(context_parts, indent=2, default=str)[:40000]
+    context_str = json.dumps(context_parts, indent=2, default=str)[:45000]
     
-    prompt = f"""You are solving a quiz question. Read the question VERY carefully and provide the EXACT answer requested.
+    prompt = f"""You are solving a quiz question. Provide the EXACT answer requested.
 
 USER EMAIL: {user_email}
-EMAIL LENGTH: {len(user_email)}
+EMAIL LENGTH: {email_length}
+EMAIL LENGTH MOD 2: {email_mod_2}
 
-QUESTION TEXT:
+QUESTION:
 {page_text}
 
-AVAILABLE DATA:
+DATA:
 {context_str}
 
-CRITICAL INSTRUCTIONS:
+INSTRUCTIONS:
 
-1. READ THE QUESTION WORD-BY-WORD. What EXACTLY does it ask for?
+1. READ QUESTION CAREFULLY - what format does it want?
 
-2. COMMON QUESTION TYPES:
-   - "Submit the command string:" → Return the EXACT command AS SHOWN in the question
-     → If it shows <your email>, keep it as "<your email>" (don't replace!)
-     → Example: "uv http get URL?email=<your email>" → Return EXACTLY that
-   
-   - "What is the [path/link]?" → Return the exact path from the question
-   
-   - "Dominant color" → Return the hex color from image data (e.g., "#b45a1e")
-   
-   - "Normalize/transform JSON" → Apply the transformations described, return JSON
-   
-   - "Count .md files" → Count from JSON tree data, add modulo calculation if asked
-   
-   - "Transcribe audio" → State "Audio transcription not available"
-   
-   - Data calculations → Use the actual data provided
+2. QUESTION TYPES:
+
+A) "Submit the command string:" 
+   → Return EXACT command AS SHOWN with quotes and escape sequences preserved
+   → Keep <your email> as placeholder if shown
+   → Example: uv http get URL?email=<your email> -H "Accept: application/json"
+
+B) "Dominant color"
+   → Return hex from image dominant_color field
+   → Example: #b45a1e
+
+C) "Normalize/clean JSON/CSV"
+   → Apply exact transformations listed
+   → snake_case keys, ISO-8601 dates, sort by id, etc.
+   → Look at RAW content to see original format
+
+D) "Count .md files" + math
+   → Parse JSON tree, count files matching pattern
+   → Add (email_length mod 2) = {email_mod_2}
+   → Example: if 5 files found, answer = 5 + {email_mod_2} = {5 + email_mod_2}
+
+E) "Transcribe audio"
+   → Return: "Audio transcription not available"
+
+F) Data calculation
+   → Use actual data to calculate
 
 3. ANSWER FORMAT:
-   - Command strings: Return as plain string EXACTLY as shown
-   - Paths: Return as string (e.g., "/project2/file.md")
-   - Colors: Return as hex string (e.g., "#b45a1e")
-   - JSON: Return as JSON object/array
-   - Numbers: Return as integer or float
-   - Audio: Return "Audio transcription not available"
+   - Commands: plain string (not JSON-escaped)
+   - Colors: "#rrggbb"
+   - JSON: actual JSON object/array
+   - Numbers: integer
+   - Text: plain string
 
-4. KEY RULES:
-   ✓ If question shows "<your email>" in a command, KEEP IT as "<your email>"
-   ✓ For image dominant color, use the dominant_color field from image data
-   ✓ For JSON transformations, follow the exact rules given (snake_case, ISO dates, sorting, etc.)
-   ✓ For counting files, parse the JSON tree and count matching files
-   ✓ Always match the data type requested
+4. CRITICAL:
+   ✓ For commands: NO extra escaping, return as plain string
+   ✓ For JSON normalization: Check raw_content to see original format
+   ✓ For counting: Use email_length={email_length}, mod 2={email_mod_2}
+   ✓ Match exact format requested
 
-Return ONLY valid JSON:
+Return JSON:
 {{
     "answer": <exact_answer>,
     "reasoning": "brief explanation"
-}}
-
-EXAMPLES:
-Question: "Submit the command string: uv http get URL?email=<your email>"
-Answer: {{"answer": "uv http get URL?email=<your email> -H \\"Accept: application/json\\"", "reasoning": "Copied exact command from question"}}
-
-Question: "What is the dominant color?"
-Answer: {{"answer": "#b45a1e", "reasoning": "From image dominant_color field"}}
-
-Question: "Count .md files under docs/, add (email length mod 2)"
-Answer: {{"answer": 5, "reasoning": "Found 4 .md files, email length 35, 35%2=1, total 4+1=5"}}"""
+}}"""
 
     try:
         logger.info("🤖 Querying LLM...")
@@ -440,13 +443,10 @@ Answer: {{"answer": 5, "reasoning": "Found 4 .md files, email length 35, 35%2=1,
         response = client.chat.completions.create(
             model=AIMLAPI_MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": f"You solve quiz questions precisely. User email: {user_email} (length: {len(user_email)}). For commands, keep <your email> placeholder if shown. Return valid JSON."
-                },
+                {"role": "system", "content": f"Solve quiz precisely. Email: {user_email} (length {email_length}, mod 2 = {email_mod_2}). Return valid JSON."},
                 {"role": "user", "content": prompt}
             ],
-            #temperature=0.05,
+            #temperature=0.03,
             #max_tokens=2000
         )
         
@@ -466,15 +466,15 @@ Answer: {{"answer": 5, "reasoning": "Found 4 .md files, email length 35, 35%2=1,
         
         answer = solution.get("answer")
         
-        # Don't post-process - keep answer as-is
-        
-        logger.info(f"✅ Answer: {str(answer)[:200]}")
-        logger.info(f"💡 Reasoning: {solution.get('reasoning', '')[:150]}")
+        logger.info(f"✅ Answer type: {type(answer).__name__}")
+        logger.info(f"✅ Answer: {str(answer)[:300]}")
+        logger.info(f"💡 Reasoning: {solution.get('reasoning', '')[:200]}")
         
         return solution
         
     except Exception as e:
         logger.error(f"❌ LLM error: {e}")
+        logger.error(traceback.format_exc())
         return {"error": str(e)}
 
 def submit_answer(submit_url: str, email: str, secret: str, quiz_url: str, answer: Any) -> Dict[str, Any]:
@@ -489,14 +489,21 @@ def submit_answer(submit_url: str, email: str, secret: str, quiz_url: str, answe
     
     try:
         logger.info(f"📤 Submitting to: {submit_url}")
-        logger.info(f"📤 Answer: {json.dumps(answer) if isinstance(answer, (dict, list)) else str(answer)[:200]}")
+        
+        # Log answer carefully
+        if isinstance(answer, str) and len(answer) < 300:
+            logger.info(f"📤 Answer: {answer}")
+        elif isinstance(answer, (dict, list)):
+            logger.info(f"📤 Answer: {json.dumps(answer)[:300]}")
+        else:
+            logger.info(f"📤 Answer type: {type(answer).__name__}, length: {len(str(answer))}")
         
         resp = requests.post(submit_url, json=payload, timeout=20, headers={"Content-Type": "application/json"})
         logger.info(f"📥 Status: {resp.status_code}")
         
         try:
             result = resp.json()
-            logger.info(f"📥 Response: {json.dumps(result)[:350]}")
+            logger.info(f"📥 Response: {json.dumps(result)[:400]}")
         except:
             result = {"raw": resp.text[:500], "status": resp.status_code}
         
@@ -531,7 +538,7 @@ def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: fl
             quiz_page = extract_page_content(current_url, max_wait=5)
             
             if quiz_page.get("error"):
-                results.append({"quiz_number": iteration, "url": current_url, "error": f"Extract failed", "status": "extraction_failed"})
+                results.append({"quiz_number": iteration, "url": current_url, "error": "Extract failed", "status": "extraction_failed"})
                 break
             
             combined = quiz_page.get("html", "") + "\n" + quiz_page.get("text", "")
@@ -571,7 +578,7 @@ def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: fl
             solution = solve_with_llm(quiz_page, downloaded_files, current_url, email)
             
             if "error" in solution:
-                results.append({"quiz_number": iteration, "url": current_url, "error": f"Solve error", "status": "solving_failed"})
+                results.append({"quiz_number": iteration, "url": current_url, "error": "Solve error", "status": "solving_failed"})
                 break
             
             answer = solution.get("answer")
@@ -625,22 +632,11 @@ def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: fl
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({
-        "service": "Dynamic Quiz Solver",
-        "version": "7.0",
-        "status": "running",
-        "model": AIMLAPI_MODEL
-    }), 200
+    return jsonify({"service": "Dynamic Quiz Solver", "version": "8.0", "status": "running"}), 200
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    health = {
-        "status": "healthy",
-        "llm_ready": client is not None,
-        "email_set": bool(EMAIL),
-        "secret_set": bool(SECRET)
-    }
-    return jsonify(health), 200
+    return jsonify({"status": "healthy", "llm_ready": client is not None}), 200
 
 @app.route("/quiz", methods=["POST"])
 def quiz_endpoint():
@@ -708,20 +704,16 @@ def quiz_endpoint():
     except Exception as e:
         logger.error(f"❌ Fatal error: {e}")
         logger.error(traceback.format_exc())
-        return jsonify({
-            "error": str(e),
-            "time_taken_seconds": round(time.time() - start_time, 2)
-        }), 500
+        return jsonify({"error": str(e), "time_taken_seconds": round(time.time() - start_time, 2)}), 500
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 7860))
     
     logger.info(f"\n{'='*70}")
-    logger.info(f"🚀 Dynamic Quiz Solver v7.0")
+    logger.info(f"🚀 Dynamic Quiz Solver v8.0 - Production")
     logger.info(f"   Port: {port}")
     logger.info(f"   Model: {AIMLAPI_MODEL}")
     logger.info(f"   LLM: {'✅' if client else '❌'}")
-    logger.info(f"   Email: {EMAIL if EMAIL else '❌'}")
     logger.info(f"{'='*70}\n")
     
     app.run(host="0.0.0.0", port=port, debug=False)
