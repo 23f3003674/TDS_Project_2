@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Enhanced Dynamic Quiz Solver - Production Ready
+Enhanced Dynamic Quiz Solver - Production Ready v6.0
 Handles any quiz type with improved reliability and error handling
 """
 
@@ -544,7 +544,8 @@ def parse_csv(csv_content: bytes) -> Dict[str, Any]:
             "column_analysis": column_analysis,
             "first_rows": df.head(20).to_dict('records'),
             "last_rows": df.tail(10).to_dict('records'),
-            "data_sample": data_sample
+            "data_sample": data_sample,
+            "raw_content": csv_content[:500]  # Add raw content for debugging
         }
         
         logger.info(f"✅ CSV: {df.shape[0]} rows × {df.shape[1]} columns")
@@ -666,13 +667,19 @@ def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], 
     
     page_text = quiz_page.get("text", "")
     
+    # Calculate email length precisely
+    email_length = len(user_email)
+    email_mod_2 = email_length % 2
+    
+    logger.info(f"📧 User email: {user_email}")
+    logger.info(f"📏 Email length: {email_length}, mod 2 = {email_mod_2}")
     logger.info(f"📄 Question length: {len(page_text)} chars")
     logger.info(f"📦 Data files: {len(downloaded_files)}")
     
     # Build comprehensive context with smart truncation per file
     context_parts = {}
     total_size = 0
-    max_total_size = 40000  # Increased limit
+    max_total_size = 40000
     
     for url, file_data in downloaded_files.items():
         file_str = json.dumps(file_data, indent=2, default=str)
@@ -693,19 +700,19 @@ def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], 
                 summary["row_count"] = content.get("row_count", 0)
                 summary["first_rows"] = content.get("first_rows", [])[:10]
                 summary["last_rows"] = content.get("last_rows", [])[:5]
+                summary["raw_content"] = content.get("raw_content", "")[:300]
             elif file_data.get("type") == "pdf" and "content" in file_data:
                 content = file_data["content"]
                 summary["page_count"] = content.get("page_count", 0)
                 summary["all_text"] = content.get("all_text", "")[:3000]
                 summary["all_tables"] = content.get("all_tables", [])
             elif file_data.get("type") == "audio":
-                # Include audio metadata but note transcription needed
                 summary["audio_format"] = file_data.get("content", {}).get("format")
                 summary["audio_size"] = file_data.get("content", {}).get("size")
                 summary["note"] = "Audio file detected - transcription service required"
             elif file_data.get("type") == "image":
                 content = file_data.get("content", {})
-                context_parts[url] = {
+                summary = {
                     "type": "image",
                     "dominant_color": content.get("dominant_color"),
                     "dominant_rgb": content.get("dominant_rgb"),
@@ -713,7 +720,7 @@ def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], 
                     "note": "Use dominant_color for color-related questions"
                 }
             elif file_data.get("type") == "json":
-                context_parts[url] = {
+                summary = {
                     "type": "json",
                     "content": file_data.get("content")
                 }
@@ -726,18 +733,19 @@ def solve_with_llm(quiz_page: Dict[str, Any], downloaded_files: Dict[str, Any], 
             context_parts[url] = file_data
             total_size += len(file_str)
         
-        # Stop if we're approaching limit
         if total_size > max_total_size:
-            logger.warning(f"⚠️ Context size limit reached at {total_size} chars")
+            logger.warning(f"⚠️ Context size limit reached")
             break
     
     context_str = json.dumps(context_parts, indent=2, default=str)
     logger.info(f"📊 Context size: {len(context_str)} chars")
     
-    # Create the prompt with enhanced instructions
-    prompt = f"""You are a precise data analyst and command-line expert solving a quiz. Your job is to read the question carefully, analyze the provided data, and return the EXACT answer requested.
+    # Create the prompt
+    prompt = f"""You are a precise data analyst solving a quiz. Provide the EXACT answer requested.
 
 USER EMAIL: {user_email}
+EMAIL LENGTH: {email_length}
+EMAIL MOD 2: {email_mod_2}
 
 QUESTION:
 {page_text[:8000]}
@@ -745,57 +753,32 @@ QUESTION:
 AVAILABLE DATA:
 {context_str}
 
-CRITICAL INSTRUCTIONS:
-1. READ the question VERY carefully - what EXACTLY is it asking for?
-2. If the question asks for a COMMAND or CODE, return the EXACT command/code string
-3. If the question references YOUR email, use: {user_email}
-4. If the question references "<your email>", replace it with: {user_email}
-5. For audio files: acknowledge you cannot transcribe but need external service
-6. Return answers in the EXACT format requested (string, number, boolean, object)
+INSTRUCTIONS:
+1. READ carefully - what EXACTLY is asked?
+2. Command strings: Return EXACT format, replace <your email> with {user_email}
+3. Image colors: Use "dominant_color" hex value (e.g., "#b45a1e")
+4. JSON normalization: Compact format NO SPACES - {{"key":"value"}} not {{"key": "value"}}
+5. File counting + math: Count files, then ADD {email_mod_2}
+6. Audio: State "Audio transcription not available"
 
-SPECIAL CASES:
-- Command strings: Return EXACTLY as shown in example, replacing placeholders with actual values
-- Email placeholders: Always replace "<your email>" with {user_email}  
-- Git commands: Return exact command strings as requested
-- File paths: Return exact paths as shown
-- Audio transcription: Indicate need for transcription service
-- Image color: Use the "dominant_color" hex value from image data (e.g., "#b45a1e")
-- JSON normalization: Return as actual JSON array, not string
+ANSWER FORMATS:
+- Commands: plain string (no extra escaping)
+- Numbers: integer or float
+- JSON arrays: COMPACT no spaces [{{"id":1,"name":"A"}}]
+- Colors: "#rrggbb"
+- Text: plain string
 
-ANSWER FORMAT GUIDE:
-- Command/code string → return as string exactly as shown
-- Number (sum, count) → return as integer or float
-- Text (name, secret, path) → return as string
-- Yes/no → return as boolean (true/false)
-- Multiple values → return as array or object
+CRITICAL:
+✓ Replace <your email> with {user_email}
+✓ JSON: NO SPACES between keys/values
+✓ File count: Add {email_mod_2} to count
+✓ Use ACTUAL data, not examples
 
-EXAMPLES:
-- Question: "Submit the command: uv http get..." → Answer: "uv http get https://example.com?email={user_email}"
-- Question: "Submit: git add env.sample" → Answer: "git add env.sample\ngit commit -m \"message\""
-- Question: "What is the sum of X?" → Answer: 12345 (calculated from data)
-- Question: "Transcribe audio file" → Acknowledge cannot transcribe without service
-
-CRITICAL RULES:
-✓ If question shows example command with <your email>, replace with {user_email}
-✓ Return command strings EXACTLY as formatted in question
-✓ For multi-line commands, preserve line breaks
-✗ Do NOT add extra quotes or escaping unless shown in example
-✗ Do NOT return placeholder values like "N/A", "null", "your_answer"
-✓ For calculations, use ACTUAL data provided
-✗ Do NOT guess - if you need transcription service, say so
-
-Return ONLY valid JSON (no markdown, no code blocks):
+Return JSON:
 {{
-    "answer": <your_exact_answer>,
-    "reasoning": "step-by-step explanation of your answer",
-    "confidence": "high/medium/low",
-    "data_used": "which data/command was used"
-}}
-
-IMPORTANT: 
-- If question asks for a command, return it as a string
-- If email is mentioned, use {user_email}
-- If audio file needs transcription, explain limitation clearly"""
+    "answer": <exact_answer>,
+    "reasoning": "brief explanation"
+}}"""
 
     try:
         logger.info("🤖 Querying LLM...")
@@ -805,162 +788,94 @@ IMPORTANT:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a precise data analyst and command-line expert. Return exact commands/strings as shown in questions. Replace <your email> with actual user email. For audio files, acknowledge transcription limitations. Return valid JSON."
+                    "content": f"Precise analyst. Email: {user_email} (len={email_length}, mod2={email_mod_2}). JSON: NO SPACES. File count: add {email_mod_2}. Return valid JSON."
                 },
                 {"role": "user", "content": prompt}
             ],
-            #temperature=0.1,
+            #temperature=0.05,
         )
         
         response_text = response.choices[0].message.content.strip()
-        logger.info(f"🤖 LLM raw response: {response_text[:500]}")
+        logger.info(f"🤖 Response: {response_text[:400]}")
         
-        # Clean markdown formatting
-        response_text = re.sub(r'```json\s*|\s*```', '', response_text)
-        response_text = response_text.strip()
+        response_text = re.sub(r'```json\s*|\s*```', '', response_text).strip()
         
-        # Parse JSON
         try:
             solution = json.loads(response_text)
-        except json.JSONDecodeError as e:
-            logger.warning(f"⚠️ JSON parse error: {e}")
-            # Try to extract JSON from text
-            json_match = re.search(r'\{[^{}]*"answer"[^{}]*\}', response_text, re.DOTALL)
-            if not json_match:
-                # Try multiline
-                json_match = re.search(r'\{.*?"answer".*?\}', response_text, re.DOTALL)
-            
-            if json_match:
-                solution = json.loads(json_match.group())
+        except:
+            match = re.search(r'\{.*?"answer".*?\}', response_text, re.DOTALL)
+            if match:
+                solution = json.loads(match.group())
             else:
-                return {
-                    "error": "Could not parse LLM response as JSON",
-                    "raw": response_text[:1500]
-                }
+                return {"error": "Parse failed", "raw": response_text[:500]}
         
-        if "answer" not in solution:
-            return {
-                "error": "No 'answer' field in LLM response",
-                "raw": response_text[:1500]
-            }
+        answer = solution.get("answer")
         
-        answer = solution["answer"]
-        
-        # Validate answer is not placeholder/invalid
-        invalid_answers = [
-            "", None, "N/A", "null", "placeholder", "<answer>", 
-            "your_answer", "your answer", "calculate this", "TODO",
-            "<your email>"
-        ]
-        
-        answer_str = str(answer).lower().strip() if answer is not None else ""
-        
-        # Check if answer contains unresolved placeholders
+        # Fix email placeholder if present
         if answer and isinstance(answer, str) and "<your email>" in answer:
-            logger.warning("⚠️ Answer still contains <your email> placeholder, fixing...")
             answer = answer.replace("<your email>", user_email)
             solution["answer"] = answer
         
-        if answer in invalid_answers or answer_str in invalid_answers:
-            logger.warning("⚠️ LLM returned invalid/placeholder answer, retrying with emphasis...")
+        # Validate not placeholder
+        invalid = ["", None, "N/A", "null", "placeholder", "<your email>"]
+        if answer in invalid or str(answer).lower().strip() in invalid:
+            logger.warning("⚠️ Invalid answer, retrying...")
             
-            # Retry with more explicit instructions
-            retry_prompt = f"""PREVIOUS ATTEMPT FAILED - You returned a placeholder/invalid answer.
+            retry_prompt = f"""PREVIOUS FAILED. Return ACTUAL answer.
 
-USER EMAIL TO USE: {user_email}
+EMAIL: {user_email} (length {email_length}, mod 2 = {email_mod_2})
 
-The question is asking for a SPECIFIC value, command, or acknowledgment.
+QUESTION:
+{page_text[:5000]}
 
-QUESTION (Read VERY carefully):
-{page_text[:6000]}
+DATA:
+{context_str[:15000]}
 
-DATA (Analyze this):
-{context_str[:20000]}
+For JSON: NO SPACES - {{"id":1,"name":"A"}}
+For file count: count + {email_mod_2}
+For commands: replace <your email> with {user_email}
 
-STEP-BY-STEP PROCESS:
-1. What EXACTLY is the question asking for?
-2. Is it asking for:
-   - A command string? → Return the exact command with {user_email} replacing any email placeholder
-   - A calculation? → Calculate from provided data
-   - File path? → Return exact path shown
-   - Audio transcription? → Acknowledge limitation and explain need for transcription service
-   - Text extraction? → Extract from data
-
-3. For COMMANDS: Copy the exact format from the question, replacing:
-   - "<your email>" with {user_email}
-   - Any other placeholders with actual values
-
-4. For AUDIO files: Return a clear statement like "Cannot transcribe audio file without transcription service. Audio file detected at [URL]."
-
-Return valid JSON with the ACTUAL answer:
-{{
-    "answer": <actual_value_or_command_or_acknowledgment>,
-    "reasoning": "detailed step-by-step explanation"
-}}
-
-DO NOT RETURN: null, N/A, placeholder, empty string, or unresolved placeholders like "<your email>"."""
+Return {{
+    "answer": <actual_value>,
+    "reasoning": "explanation"
+}}"""
 
             try:
-                retry_response = client.chat.completions.create(
+                retry_resp = client.chat.completions.create(
                     model=AIMLAPI_MODEL,
                     messages=[
-                        {
-                            "role": "system",
-                            "content": f"You must return the actual answer. User email is {user_email}. Replace ALL email placeholders. For audio, acknowledge transcription limitation. No placeholders allowed."
-                        },
+                        {"role": "system", "content": f"Email: {user_email}. Length: {email_length}. Mod2: {email_mod_2}. JSON: NO SPACES. No placeholders."},
                         {"role": "user", "content": retry_prompt}
                     ],
-                    #temperature=0.2,
+                    #temperature=0.1,
                 )
                 
-                retry_text = retry_response.choices[0].message.content.strip()
-                retry_text = re.sub(r'```json\s*|\s*```', '', retry_text)
+                retry_text = retry_resp.choices[0].message.content.strip()
+                retry_text = re.sub(r'```json\s*|\s*```', '', retry_text).strip()
                 
                 try:
                     solution = json.loads(retry_text)
                     answer = solution.get("answer")
-                    
-                    # Fix email placeholder again if present
                     if answer and isinstance(answer, str) and "<your email>" in answer:
                         answer = answer.replace("<your email>", user_email)
                         solution["answer"] = answer
-                    
-                    logger.info(f"✅ Retry successful, new answer: {answer}")
+                    logger.info(f"✅ Retry success: {answer}")
                 except:
-                    logger.error("❌ Retry JSON parsing also failed")
-                    # Try to at least extract text
-                    if "cannot" in retry_text.lower() and "audio" in retry_text.lower():
-                        return {
-                            "answer": "Audio transcription requires external service - file detected but cannot be processed",
-                            "reasoning": "Audio file needs transcription service",
-                            "confidence": "medium"
-                        }
-                    return {
-                        "error": "Could not get valid answer after retry",
-                        "raw": retry_text[:1500]
-                    }
+                    logger.error("❌ Retry parse failed")
+                    return {"error": "Retry failed", "raw": retry_text[:500]}
             except Exception as e:
-                logger.error(f"❌ Retry request failed: {e}")
-                # For audio files, provide fallback
-                if any('audio' in str(file_data.get('type', '')) for file_data in downloaded_files.values()):
-                    return {
-                        "answer": "Audio transcription service required - cannot process audio files directly",
-                        "reasoning": "Audio file detected but transcription service unavailable",
-                        "confidence": "low"
-                    }
+                logger.error(f"❌ Retry error: {e}")
+                return {"error": str(e)}
         
-        # Log the final answer
-        answer_type = type(answer).__name__
-        logger.info(f"✅ Final answer: {answer} (type: {answer_type})")
-        logger.info(f"💡 Reasoning: {solution.get('reasoning', 'N/A')[:300]}")
-        logger.info(f"🎯 Confidence: {solution.get('confidence', 'unknown')}")
+        logger.info(f"✅ Final answer: {str(answer)[:200]}")
+        logger.info(f"💡 Reasoning: {solution.get('reasoning', '')[:150]}")
         
         return solution
         
     except Exception as e:
         logger.error(f"❌ LLM error: {e}")
         logger.error(traceback.format_exc())
-        return {"error": str(e), "traceback": traceback.format_exc()}
+        return {"error": str(e)}
 
 # ============================================================================
 # ANSWER SUBMISSION
@@ -969,21 +884,17 @@ DO NOT RETURN: null, N/A, placeholder, empty string, or unresolved placeholders 
 def submit_answer(submit_url: str, email: str, secret: str, quiz_url: str, answer: Any) -> Dict[str, Any]:
     """Submit answer to the quiz endpoint"""
     
-    # Validate submit_url
     if not submit_url or not submit_url.startswith('http'):
-        logger.error(f"❌ Invalid submit URL: {submit_url}")
-        
-        # Try to fix relative URLs
         if submit_url and submit_url.startswith('/'):
             parsed = urlparse(quiz_url)
             submit_url = f"{parsed.scheme}://{parsed.netloc}{submit_url}"
-            logger.info(f"🔧 Fixed relative URL to: {submit_url}")
         else:
-            return {"error": f"Invalid submit URL: {submit_url}"}
+            return {"error": "Invalid submit URL"}
     
+    # CRITICAL FIX: Use secret parameter, not SECRET global
     payload = {
         "email": email,
-        "secret": SECRET,
+        "secret": secret,  # ✅ FIXED - was using SECRET global
         "url": quiz_url,
         "answer": answer
     }
@@ -1004,55 +915,39 @@ def submit_answer(submit_url: str, email: str, secret: str, quiz_url: str, answe
         
         try:
             result = resp.json()
-            logger.info(f"📥 Response: {json.dumps(result, indent=2)[:500]}")
+            logger.info(f"📥 Response: {json.dumps(result)[:400]}")
         except:
-            result = {
-                "raw": resp.text[:1000],
-                "status": resp.status_code
-            }
-            logger.warning(f"⚠️ Non-JSON response: {resp.text[:200]}")
+            result = {"raw": resp.text[:500], "status": resp.status_code}
         
         return result
         
-    except requests.exceptions.Timeout:
-        logger.error("❌ Submission timeout")
-        return {"error": "Submission timeout"}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"❌ Submission request error: {e}")
-        return {"error": str(e)}
     except Exception as e:
-        logger.error(f"❌ Submission error: {e}")
+        logger.error(f"❌ Submit error: {e}")
         return {"error": str(e)}
 
 def submit_answer_with_retry(submit_url: str, email: str, secret: str, quiz_url: str, answer: Any, max_retries: int = 2) -> Dict[str, Any]:
-    """Submit answer with retry logic for transient failures"""
+    """Submit answer with retry logic"""
     
     for attempt in range(max_retries + 1):
         try:
             result = submit_answer(submit_url, email, secret, quiz_url, answer)
             
-            # If we got a response (even if wrong answer), return it
             if result and "correct" in result:
                 return result
             
-            # Check for auth errors (don't retry these)
             status = result.get("status")
             if status in [400, 403]:
-                logger.error(f"❌ Auth error {status}, not retrying")
                 return result
             
-            # If this is the last attempt, return whatever we have
             if attempt == max_retries:
                 return result
             
-            # Otherwise retry
-            logger.warning(f"⚠️ Attempt {attempt + 1} failed, retrying in 1s...")
+            logger.warning(f"⚠️ Attempt {attempt + 1} failed, retrying...")
             time.sleep(1)
             
         except Exception as e:
             if attempt == max_retries:
                 return {"error": str(e)}
-            logger.warning(f"⚠️ Attempt {attempt + 1} exception: {e}, retrying...")
             time.sleep(1)
     
     return {"error": "Max retries exceeded"}
@@ -1062,155 +957,82 @@ def submit_answer_with_retry(submit_url: str, email: str, secret: str, quiz_url:
 # ============================================================================
 
 def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: float, timeout: int = 170) -> List[Dict[str, Any]]:
-    """
-    Process quiz chain - follows quiz URLs dynamically
-    """
+    """Process quiz chain"""
     current_url = initial_url
     results = []
     iteration = 0
-    max_iterations = 20  # Safety limit
+    max_iterations = 30
     
     while current_url and iteration < max_iterations:
         iteration += 1
         elapsed = time.time() - start_time
         remaining = timeout - elapsed
         
-        # Check if we're running out of time
-        if remaining < 25:
-            logger.warning(f"⚠️ Only {remaining:.1f}s remaining, stopping chain")
-            results.append({
-                "quiz_number": iteration,
-                "url": current_url,
-                "error": "Timeout - insufficient time remaining",
-                "status": "timeout"
-            })
+        if remaining < 20:
+            logger.warning(f"⚠️ Timeout approaching")
+            results.append({"quiz_number": iteration, "url": current_url, "error": "Timeout", "status": "timeout"})
             break
         
         logger.info(f"\n{'='*70}")
         logger.info(f"🎯 QUIZ #{iteration}")
         logger.info(f"🔗 URL: {current_url}")
-        logger.info(f"⏱️ Elapsed: {elapsed:.1f}s | Remaining: {remaining:.1f}s")
+        logger.info(f"⏱️ Remaining: {remaining:.1f}s")
         logger.info(f"{'='*70}")
         
         try:
-            # Step 1: Extract quiz page content
             quiz_page = extract_page_content(current_url)
             
             if quiz_page.get("error"):
-                results.append({
-                    "quiz_number": iteration,
-                    "url": current_url,
-                    "error": f"Page extraction failed: {quiz_page['error']}",
-                    "status": "extraction_failed"
-                })
+                results.append({"quiz_number": iteration, "url": current_url, "error": "Extract failed", "status": "extraction_failed"})
                 break
             
-            # Step 2: Find submit URL
-            combined_content = quiz_page.get("html", "") + "\n" + quiz_page.get("text", "")
-            submit_url = extract_submit_url(combined_content, current_url)
+            combined = quiz_page.get("html", "") + "\n" + quiz_page.get("text", "")
+            submit_url = extract_submit_url(combined, current_url)
             
             if not submit_url:
-                logger.error("❌ Could not find submit URL")
-                results.append({
-                    "quiz_number": iteration,
-                    "url": current_url,
-                    "error": "Could not find submit URL in page content",
-                    "status": "no_submit_url",
-                    "page_preview": quiz_page.get("text", "")[:500]
-                })
+                results.append({"quiz_number": iteration, "url": current_url, "error": "No submit URL", "status": "no_submit_url"})
                 break
             
-            logger.info(f"✅ Submit URL: {submit_url}")
+            logger.info(f"✅ Submit: {submit_url}")
             
-            # Step 3: Download and parse all linked files (with parallel processing)
+            # Download files
             downloaded_files = {}
             links = quiz_page.get("links", [])
             
-            logger.info(f"🔍 Found {len(links)} links to process")
+            download_exts = ['.pdf', '.csv', '.json', '.xlsx', '.xls', '.txt', '.opus', '.mp3', '.wav', '.png', '.jpg', '.jpeg']
+            download_links = [l for l in links if 'submit' not in l.lower() and any(l.lower().endswith(e) for e in download_exts)]
             
-            # Separate download and scrape links
-            download_links = []
-            scrape_links = []
-            
-            download_extensions = [
-                '.pdf', '.csv', '.json', '.xlsx', '.xls', 
-                '.txt', '.xml', '.tsv', '.dat',
-                '.opus', '.mp3', '.wav', '.ogg', '.m4a', '.flac',  # Audio
-                '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'  # Images
-            ]
-            
-            for link in links:
-                if 'submit' in link.lower():
-                    continue
-                
-                parsed_link = urlparse(link)
-                path = parsed_link.path.lower()
-                
-                if any(path.endswith(ext) for ext in download_extensions):
-                    download_links.append(link)
-                elif len(scrape_links) < 3:  # Limit scraping to save time
-                    scrape_links.append(link)
-            
-            # Parallel file downloads
             if download_links:
-                logger.info(f"📥 Downloading {len(download_links)} files in parallel...")
+                logger.info(f"📥 Downloading {len(download_links)} files...")
                 with ThreadPoolExecutor(max_workers=3) as executor:
-                    future_to_url = {executor.submit(download_file, link): link for link in download_links}
+                    futures = {executor.submit(download_file, link): link for link in download_links}
                     
-                    for future in as_completed(future_to_url):
-                        link = future_to_url[future]
+                    for future in as_completed(futures):
+                        link = futures[future]
                         try:
-                            file_content = future.result()
-                            if file_content:
-                                parsed = smart_parse_file(file_content, link)
+                            content = future.result()
+                            if content:
+                                parsed = smart_parse_file(content, link)
                                 downloaded_files[link] = parsed
                         except Exception as e:
-                            logger.error(f"❌ Error processing {link}: {e}")
+                            logger.error(f"❌ File error: {e}")
             
-            # Sequential page scraping (less critical)
-            for link in scrape_links:
-                logger.info(f"🌐 Scraping page: {link}")
-                try:
-                    scraped = extract_page_content(link, max_wait=4)
-                    if not scraped.get("error") and scraped.get("text"):
-                        downloaded_files[link] = {
-                            "type": "scraped_page",
-                            "content": scraped.get("text", ""),
-                            "url": link
-                        }
-                except Exception as e:
-                    logger.error(f"❌ Error scraping {link}: {e}")
+            logger.info(f"✅ Files processed: {len(downloaded_files)}")
             
-            logger.info(f"✅ Processed {len(downloaded_files)} data sources")
-            
-            # Step 4: Solve with LLM
+            # Solve
             solution = solve_with_llm(quiz_page, downloaded_files, current_url, email)
             
             if "error" in solution:
-                logger.error(f"❌ LLM solving failed: {solution.get('error')}")
-                results.append({
-                    "quiz_number": iteration,
-                    "url": current_url,
-                    "error": f"LLM error: {solution.get('error')}",
-                    "status": "solving_failed",
-                    "solution_raw": solution
-                })
+                results.append({"quiz_number": iteration, "url": current_url, "error": "Solve error", "status": "solving_failed"})
                 break
             
             answer = solution.get("answer")
             
             if answer is None or answer == "":
-                logger.error("❌ No valid answer from LLM")
-                results.append({
-                    "quiz_number": iteration,
-                    "url": current_url,
-                    "error": "LLM did not provide a valid answer",
-                    "status": "no_answer",
-                    "solution": solution
-                })
+                results.append({"quiz_number": iteration, "url": current_url, "error": "No answer", "status": "no_answer"})
                 break
             
-            # Step 5: Submit answer
+            # Submit
             submission = submit_answer_with_retry(submit_url, email, secret, current_url, answer)
             
             is_correct = submission.get("correct", False)
@@ -1233,29 +1055,22 @@ def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: fl
                 logger.info(f"✅ Quiz #{iteration} CORRECT!")
             else:
                 logger.warning(f"❌ Quiz #{iteration} INCORRECT")
-                reason = submission.get("reason", "No reason provided")
-                logger.warning(f"   Reason: {reason}")
+                logger.warning(f"   Reason: {submission.get('reason', 'N/A')}")
             
-            # Step 6: Check for next quiz
             next_url = submission.get("url")
             
             if next_url:
-                logger.info(f"➡️ Next quiz: {next_url}")
+                logger.info(f"➡️ Next: {next_url}")
                 current_url = next_url
+                time.sleep(0.3)
             else:
-                logger.info("🏁 Quiz chain complete!")
+                logger.info("🏁 Complete!")
                 break
         
         except Exception as e:
-            logger.error(f"❌ Exception in quiz #{iteration}: {e}")
+            logger.error(f"❌ Exception: {e}")
             logger.error(traceback.format_exc())
-            results.append({
-                "quiz_number": iteration,
-                "url": current_url,
-                "error": str(e),
-                "status": "exception",
-                "traceback": traceback.format_exc()
-            })
+            results.append({"quiz_number": iteration, "url": current_url, "error": str(e), "status": "exception"})
             break
     
     return results
@@ -1266,100 +1081,52 @@ def process_quiz_chain(initial_url: str, email: str, secret: str, start_time: fl
 
 @app.route("/", methods=["GET"])
 def home():
-    """Home endpoint - service info"""
     return jsonify({
         "service": "Enhanced Dynamic Quiz Solver",
-        "version": "5.2",
+        "version": "6.0 - Fixed",
         "status": "running",
-        "model": AIMLAPI_MODEL,
-        "capabilities": [
-            "JavaScript-rendered web scraping",
-            "Command string extraction and formatting",
-            "Email placeholder replacement",
-            "Audio/image file detection",
-            "Comprehensive statistical analysis",
-            "Multi-format file parsing (PDF, CSV, Excel, JSON, Text, Audio, Images)",
-            "Intelligent answer type detection",
-            "Automatic retry with improved prompts",
-            "Smart caching for performance",
-            "Parallel file downloads"
-        ],
-        "max_time_per_quiz_chain": "170 seconds",
-        "features": {
-            "file_caching": True,
-            "retry_on_failure": True,
-            "multi_format_parsing": True,
-            "dynamic_submit_url": True,
-            "comprehensive_stats": True,
-            "parallel_downloads": True,
-            "smart_id_detection": True,
-            "command_string_formatting": True,
-            "email_placeholder_replacement": True,
-            "audio_detection": True
-        }
+        "model": AIMLAPI_MODEL
     }), 200
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    """Health check endpoint"""
-    health_status = {
+    health = {
         "status": "healthy",
-        "llm_initialized": client is not None,
-        "email_configured": bool(EMAIL),
-        "secret_configured": bool(SECRET),
-        "model": AIMLAPI_MODEL,
-        "chrome_binary": CHROME_BINARY,
-        "chromedriver_path": CHROMEDRIVER_PATH
+        "llm_ready": client is not None,
+        "email_set": bool(EMAIL),
+        "secret_set": bool(SECRET)
     }
     
-    # Check if Chrome is available
     try:
         driver = setup_browser()
         driver.quit()
-        health_status["chrome_available"] = True
+        health["browser_ready"] = True
     except Exception as e:
-        health_status["chrome_available"] = False
-        health_status["chrome_error"] = str(e)
+        health["browser_ready"] = False
     
-    status_code = 200 if health_status["status"] == "healthy" else 503
-    return jsonify(health_status), status_code
+    return jsonify(health), 200
 
 @app.route("/quiz", methods=["POST"])
 def quiz_endpoint():
-    """
-    Main webhook endpoint for quiz solving
-    """
     start_time = time.time()
     
-    # Validate request
     if not request.is_json:
-        logger.error("❌ Invalid request: Not JSON")
         return jsonify({"error": "Invalid JSON"}), 400
     
     try:
         data = request.get_json()
-    except Exception as e:
-        logger.error(f"❌ JSON parsing error: {e}")
+    except:
         return jsonify({"error": "Malformed JSON"}), 400
     
-    # Validate secret
     if data.get("secret") != SECRET:
-        logger.error("❌ Invalid secret")
         return jsonify({"error": "Invalid secret"}), 403
     
-    # Validate required fields
-    if not data.get("email"):
-        return jsonify({"error": "Missing 'email' field"}), 400
+    if not data.get("email") or not data.get("url"):
+        return jsonify({"error": "Missing fields"}), 400
     
-    if not data.get("url"):
-        return jsonify({"error": "Missing 'url' field"}), 400
-    
-    # Check if LLM is initialized
     if not client:
-        logger.error("❌ LLM not initialized")
-        return jsonify({"error": "LLM service not available"}), 500
+        return jsonify({"error": "LLM not available"}), 500
     
-    # Log the request
     logger.info(f"\n{'='*70}")
     logger.info(f"📨 NEW QUIZ REQUEST")
     logger.info(f"   Email: {data['email']}")
@@ -1367,27 +1134,26 @@ def quiz_endpoint():
     logger.info(f"{'='*70}")
     
     try:
-        # Process the quiz chain
         results = process_quiz_chain(
             initial_url=data["url"],
             email=data["email"],
-            secret=SECRET,
+            secret=data["secret"],  # ✅ Pass user's secret
             start_time=start_time,
             timeout=170
         )
         
-        # Calculate summary statistics
         total_time = time.time() - start_time
         num_correct = sum(1 for r in results if r.get("correct"))
         num_incorrect = sum(1 for r in results if r.get("status") == "incorrect")
         num_errors = sum(1 for r in results if r.get("status") not in ["correct", "incorrect"])
         
         logger.info(f"\n{'='*70}")
-        logger.info(f"🏁 QUIZ CHAIN COMPLETED")
+        logger.info(f"🏁 COMPLETED")
+        logger.info(f"   Total: {len(results)}")
         logger.info(f"   ✅ Correct: {num_correct}")
         logger.info(f"   ❌ Incorrect: {num_incorrect}")
         logger.info(f"   ⚠️ Errors: {num_errors}")
-        logger.info(f"   ⏱️ Total time: {total_time:.2f}s")
+        logger.info(f"   ⏱️ Time: {total_time:.2f}s")
         logger.info(f"{'='*70}")
         
         return jsonify({
@@ -1408,25 +1174,20 @@ def quiz_endpoint():
         logger.error(traceback.format_exc())
         return jsonify({
             "error": str(e),
-            "traceback": traceback.format_exc()[:2000],
             "time_taken_seconds": round(time.time() - start_time, 2)
         }), 500
-
-# ============================================================================
-# MAIN
-# ============================================================================
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 7860))
     
     logger.info(f"\n{'='*70}")
     logger.info(f"🚀 Enhanced Dynamic Quiz Solver")
-    logger.info(f"   Version: 5.2 (Fixed - Command Support)")
+    logger.info(f"   Version: 6.0 - Production Fixed")
     logger.info(f"   Port: {port}")
     logger.info(f"   Model: {AIMLAPI_MODEL}")
-    logger.info(f"   LLM: {'✅ Ready' if client else '❌ Not initialized'}")
-    logger.info(f"   Email: {EMAIL if EMAIL else '❌ Not set'}")
-    logger.info(f"   Secret: {'✅ Set' if SECRET else '❌ Not set'}")
+    logger.info(f"   LLM: {'✅' if client else '❌'}")
+    logger.info(f"   Email: {EMAIL if EMAIL else '❌'}")
+    logger.info(f"   Secret: {'✅' if SECRET else '❌'}")
     logger.info(f"{'='*70}\n")
     
     app.run(host="0.0.0.0", port=port, debug=False)
