@@ -983,7 +983,7 @@ def submit_answer(submit_url: str, email: str, secret: str, quiz_url: str, answe
     
     payload = {
         "email": email,
-        "secret": secret,
+        "secret": SECRET,
         "url": quiz_url,
         "answer": answer
     }
