@@ -1371,7 +1371,7 @@ def quiz_endpoint():
         results = process_quiz_chain(
             initial_url=data["url"],
             email=data["email"],
-            secret=data["secret"],
+            secret=SECRET,
             start_time=start_time,
             timeout=170
         )
